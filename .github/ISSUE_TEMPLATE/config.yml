@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Windows or macOS support
+    url: https://github.com/foxpodz/ryuo-iv-screen/blob/main/README.md#install
+    about: >
+      The protocol works anywhere hidapi does, but CPU temperature and fan
+      readings come from Linux hwmon, so other platforms render zeros. I built
+      this for Linux and am not planning a Windows backend — the protocol is
+      fully documented, so a client for it is very welcome.
+  - name: AMD GPU telemetry
+    url: https://github.com/foxpodz/ryuo-iv-screen/blob/main/README.md#known-limits--dead-ends
+    about: >
+      GPU stats come from nvidia-smi. An amdgpu/sysfs path would slot into
+      _nvidia()'s place — PRs welcome, I don't have the hardware to test it.

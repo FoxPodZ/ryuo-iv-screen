@@ -1,0 +1,56 @@
+name: Bug in the client
+description: ryuo_send.py / ryuo_ctl.py / ryuo_proto.py misbehaves
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things that are **not** bugs, so you don't spend an evening on them:
+
+        * **Your changes revert after ~10 seconds.** `POST all` is a dead-man's
+          switch. Run the telemetry loop, not `--config-only`. See PROTOCOL.md §10.
+        * **The widgets vanish for 2 seconds every ~5 minutes.** That's the OLED
+          burn-in protection, internal to the launcher. PROTOCOL.md §7.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you run, and what happened?
+      description: The exact command line, and the output.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python version
+      description: >
+        Note that CPU temperature and fan readings come from Linux hwmon via
+        psutil. On other platforms they read 0 — that's a known limit, not a bug.
+      placeholder: "Arch Linux, Python 3.12"
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Cooler model and firmware
+      placeholder: "Ryuo IV SLC 360 ARGB, 1.0.10"
+
+  - type: dropdown
+    id: tests
+    attributes:
+      label: Does `pytest tests/` pass?
+      description: Those need no hardware. If they fail, that narrows it a lot.
+      options:
+        - "Yes"
+        - "No — pasting the failure above"
+        - "Haven't tried"

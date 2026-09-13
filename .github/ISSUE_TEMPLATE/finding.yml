@@ -1,0 +1,72 @@
+name: Protocol finding
+description: You tested something PROTOCOL.md marks 📖 / ⚠️ / open, and now you know
+labels: ["finding"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks — this is the most useful kind of issue for this repo. PROTOCOL.md
+        marks a lot of things as read-from-source or observed-once; one clean
+        report promotes them.
+
+        **Before you paste a log:** strip your CPU/GPU model strings, hostnames,
+        and anything else you didn't mean to share. See `captures/README.md`.
+
+  - type: input
+    id: what
+    attributes:
+      label: What did you test?
+      description: Resource, field, or the section number it lives under.
+      placeholder: "POST power, event strings — §4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened on the panel?
+      description: >
+        What you actually saw, in absolute terms rather than relative to the
+        previous state. "Widgets gone, panel dim, standby.mp4 playing" beats
+        "it went dark".
+    validations:
+      required: true
+
+  - type: dropdown
+    id: keepalive
+    attributes:
+      label: Was a keepalive running?
+      description: >
+        `POST all` is a dead-man's switch — without it the session lapses after
+        ~10s and the screen reverts, which looks identical to a failed command.
+        If ASUS Info Hub was open in the background, *it* was the keepalive.
+      options:
+        - "Yes — tests/probe.py or ryuo_send.py was running throughout"
+        - "No"
+        - "Info Hub was open in the background"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      placeholder: "1.0.10"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Cooler model
+      placeholder: "Ryuo IV SLC 360 ARGB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or reply (optional)
+      description: "`adb logcat` output, the device's reply, or probe-results.md."
+      render: text

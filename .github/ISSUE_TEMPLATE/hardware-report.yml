@@ -1,0 +1,64 @@
+name: Hardware report — does it work on your unit?
+description: Tell me whether a different Ryuo IV variant or firmware works
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Everything here was verified on one cooler, on firmware 1.0.7 and 1.0.10.
+        Other variants very likely share the board and the launcher, but nobody
+        has checked. Reports either way are welcome — "it just worked" is useful.
+
+  - type: input
+    id: model
+    attributes:
+      label: Exact model
+      placeholder: "ROG Ryuo IV SLC 240 ARGB"
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: Info Hub shows it, or check the recovery fingerprint.
+      placeholder: "1.0.10"
+    validations:
+      required: true
+
+  - type: input
+    id: usb
+    attributes:
+      label: USB ID and product string
+      description: >
+        From `python ryuo_send.py --list`, or `lsusb`. The vendor id changes
+        between firmware versions; the product id should be 1C76.
+      placeholder: "0B05:1C76 — 'ROG RYUO IV Standard'"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: works
+    attributes:
+      label: Did it work?
+      options:
+        - "Yes — widgets and telemetry render"
+        - "Partly"
+        - "No"
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: What worked and what didn't
+      description: >
+        If partly or no — what did you send, what did the panel do, and was a
+        keepalive running the whole time?
+
+  - type: input
+    id: panel
+    attributes:
+      label: Panel resolution (optional)
+      description: "`adb shell wm size`, if you have adb to it."
+      placeholder: "2240x1080"
