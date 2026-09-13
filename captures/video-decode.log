@@ -1,0 +1,28 @@
+# ASUS ROG Ryuo IV screen, firmware 1.0.10.
+# `adb logcat` while the launcher was asked to play two clips: one that works
+# (1920x926) and one that doesn't (2240x1080).
+#
+# The important thing here is that playback does NOT go through Android's
+# MediaCodec/OMX at all. It goes through `rockit`, Rockchip's own media
+# framework, and the decoder it picks is `rk_mpp` -- hardware.
+
+# ---- 1920x926: PLAYS -------------------------------------------------------
+D rockit  : RTConfigXML      {verifyCodecTag    :221} verify codec Tag:: codecName = avc1
+I h264d_api: is_avcC=1
+D rockit  : (null)           {util_dump_str     :169}   video chain: chain(demux/avcodec/videosink), codec(name=rk_mpp/bitrate=2201k/1920x926x@30.00)
+
+D rockit  : FFAdapterFormat  {ffmpeg_log_callbac:095} ffmpeg: : Video: h264 (avc1 / 0x31637661), yuv420p(progressive), 1920x926 [SAR 1:1 DAR 960:463], 2201 kb/s
+D rockit  : RTConfigXML      {verifyCodecTag    :221} verify codec Tag:: codecName = avc1
+I h264d_api: is_avcC=1
+D rockit  : (null)           {util_dump_str     :169}   video chain: chain(demux/avcodec/videosink), codec(name=rk_mpp/bitrate=2201k/1920x926x@30.00)
+
+# ---- 2240x1080: BLACK SCREEN -----------------------------------------------
+# Note RTConfigMeta instead of RTConfigXML, and a different line number.
+# It never reaches h264d_api and never builds a video chain. It just retries.
+D rockit  : FFAdapterFormat  {ffmpeg_log_callbac:095} ffmpeg: : Video: h264 (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 2240x1080 [SAR 1:1 DAR 56:27], 2935 kb/s
+D rockit  : RTConfigMeta     {verifyCodecTag    :154} verify codec Tag:: codecName = avc1
+D rockit  : FFAdapterFormat  {ffmpeg_log_callbac:095} ffmpeg: : Video: h264 (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 2240x1080 [SAR 1:1 DAR 56:27], 2935 kb/s
+D rockit  : RTConfigMeta     {verifyCodecTag    :154} verify codec Tag:: codecName = avc1
+D rockit  : FFAdapterFormat  {ffmpeg_log_callbac:095} ffmpeg: : Video: h264 (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 2240x1080 [SAR 1:1 DAR 56:27], 2935 kb/s
+D rockit  : RTConfigMeta     {verifyCodecTag    :154} verify codec Tag:: codecName = avc1
+# ... repeats indefinitely, roughly every 80 ms

@@ -1,0 +1,42 @@
+# ASUS ROG Ryuo IV screen, Android recovery, after Info Hub was handed the
+# official 1.0.3 firmware package while the device was running 1.0.10.
+#
+# Transcribed from a photo of the panel -- the device has no buttons, so the
+# menu's "Use volume up/down and power" instruction is unusable and the only
+# way out is `adb reboot`.
+#
+# Nothing was flashed. Note "result 0" on the verification line: the package
+# SIGNATURE was accepted. The downgrade was stopped purely by the timestamp
+# assertion afterwards.
+
+Android Recovery
+rockchip/cm16/cm16
+13/TQ3C.230805.001.B2/eng.server.20251229.092713
+user/release-keys
+Use volume up/down and power.
+
+    Reboot system now          <- only usable entry, and only via adb
+    Reboot to bootloader
+    Enter fastboot
+    Apply update from ADB
+    Apply update from SD card
+    Wipe data/factory reset
+    Wipe cache partition
+    Mount /system
+    View recovery logs
+    Run graphics test
+    Run locale test
+    Enter rescue
+    Power off
+
+check_media_package...
+check_media_package path=@/cache/recovery/block.map
+start_recovery reallyPath=@/cache/recovery/block.map after check_media_package
+supported API: 3
+Finding update package...
+Verifying update package...
+Update package verification took 3.6 s (result 0)
+Installing update...
+E3003: Can't install this package (Tue Sep  9 17:11:13 CST 2025) over newer build (Mon Dec 29 09:26:28 CST 2025).
+ERROR: recovery: Error in @/cache/recovery/block.map (status 1)
+Installation aborted.

@@ -1,0 +1,9 @@
+# ASUS Info Hub <-> ROG Ryuo IV screen, split-screen mode.
+# Captured with `adb logcat` on the cooler while genuine Info Hub drove it,
+# at the moment the user switched the app to Screen Splitting.
+#
+# This is the evidence for PROTOCOL.md section 8. Unmodified except for the
+# comment header. Media filenames are Info Hub's own auto-generated names --
+# it renames every upload to YYYY-MM-DD_HH-MM-SS-mmm.<ext>.
+#
+09-07 21:16:55.879   778  1258 D HSMainActivity: --screenConfigChange--config:ScreenConfig{Type='null', id='Customization', screenMode='Screen Splitting', ratio='null', playMode=[Single, Single], media=[[2026-09-07_19-01-12-231.png], [2026-09-07_19-01-32-962.png]], sysinfoDisplay=[CPU Temperature, GPU Temperature, , , , ], settings=[{titleColor=#2ee525, contentColor=#FFFFFF, filter={value=null, opacity=100.0}, badges=[]}, {titleColor=#2ee525, contentColor=#FFFFFF, filter={value=null, opacity=100.0}, badges=[]}], timeZone='null'}

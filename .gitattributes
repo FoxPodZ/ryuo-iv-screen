@@ -1,0 +1,5 @@
+# Keep LF in the repo regardless of who commits from where. CRLF in the udev
+# rule or a shell snippet breaks it on Linux.
+* text=auto eol=lf
+*.png binary
+*.mp4 binary

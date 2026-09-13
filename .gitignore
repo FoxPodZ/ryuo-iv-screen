@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.idea/
+.vscode/
+
+# tool output
+out/
+tests/probe-results.md

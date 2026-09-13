@@ -1,0 +1,27 @@
+# ASUS ROG Ryuo IV screen — give the logged-in user access to the hidraw node.
+# Install: sudo cp 70-ryuo.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+#          (then replug the cooler, or reboot)
+#
+# The number matters. TAG+="uaccess" is only turned into an ACL by systemd's
+# 73-seat-late.rules, and udev runs rule files in filename order -- a tag added
+# in 99-*.rules is never seen by 73 and does nothing. Keep this file below 73.
+#
+# TWO vendor ids, because it changes with firmware:
+#   fw 1.0.3   0b05 (ASUSTek)          fw 1.0.7   1c75 (BYDevice/Baiyi)
+#   fw 1.0.10  0b05 (ASUSTek)
+# The product id 1c76 is stable across every version seen, so both rules are
+# here and you don't have to care which firmware you're on.
+#
+# NOTE 0b05:19af is the motherboard's Aura LED controller, NOT this device.
+# Since the cooler now also uses 0b05, the product id is the only thing
+# separating them -- don't relax these rules to match on vendor alone.
+#
+# TAG+="uaccess" hands the device to whoever is physically logged in, via an
+# ACL that systemd drops again on logout. This is what you want on any systemd
+# distro. If you are not on systemd, comment the uaccess lines and use the
+# plugdev ones instead (and make sure your user is in the plugdev group).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1c76", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1c75", ATTRS{idProduct}=="1c76", TAG+="uaccess"
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1c76", MODE="0660", GROUP="plugdev"
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1c75", ATTRS{idProduct}=="1c76", MODE="0660", GROUP="plugdev"
