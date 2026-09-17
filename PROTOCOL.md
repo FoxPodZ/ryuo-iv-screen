@@ -53,6 +53,66 @@ The product string is worth knowing too: `ROG RYUO IV Standard` on 1.0.10 is a
 far better identifier than the generic `HID Interface` older firmware reports —
 and the word *Standard* suggests ASUS expects other variants to exist.
 
+### `BY_PC_ON` / `BY_PC_OFF` — the reopen broadcast Info Hub sends
+
+When Info Hub connects, it sends an Android broadcast:
+
+```sh
+adb shell am broadcast -a android.intent.action.BY_PC_ON
+```
+
+It has to come over adb. No HID command handler in `SerialService` sends it,
+so there is no way to trigger it from the protocol itself. `SerialService`
+registers for it, and for `BY_PC_OFF`, at runtime in `onCreate()`. The receiver
+declared in the manifest does nothing: Android builds a fresh instance for it
+with no callback attached, so the broadcast only lands while the service is
+running.
+
+**You don't need either one.** `SerialService.onCreate()` opens `/dev/hidg0` at
+boot, and nothing in this repository ever sends them.
+
+| Broadcast | What it actually does |
+| --- | --- |
+| `BY_PC_ON` | Opens `/dev/hidg0` again and sets `sys.device_open=1`. The old handle isn't closed first; whether the native `libhid_port.so` releases it is unchecked (the library lives in the system image, not the APK). The reader thread isn't restarted. |
+| `BY_PC_OFF` | Sets `sys.device_open=0`, and that's all. The device isn't closed and the reader isn't stopped, so traffic keeps flowing both ways. |
+
+Why it exists at all, when the device is already open:
+
+**It's probably left over from an older design.** The naming suggests the
+device was once held open only while the PC app ran. The shipping service opens
+it at boot and never really closes it, so `OFF` is inert and `ON` means "open it
+again".
+
+**It may also be insurance against a stale handle.** *Not yet confirmed on the
+hardware.* In the Linux HID gadget driver, `/dev/hidg0` is created when the
+gadget binds and removed when it unbinds. If the gadget is rebuilt after boot —
+a `sys.usb.config` change is the obvious trigger — the node is replaced while
+`SerialService` still holds the old one. Nothing would notice: no error,
+`sys.device_open` still reads `1`, and the 10-second read watchdog the service
+arms (`MSG_TIMEOUT`, `103`) has no handler, so it does nothing when it expires.
+HID would just go quiet until a reboot or a `BY_PC_ON`.
+
+adb runs on the same gadget, so the moment Info Hub's adb connection comes up is
+exactly when a rebuild could have happened, and a reopen on every connect costs
+nothing. Opening the same node again doesn't reset any driver state, which is
+why on an ordinary connect the broadcast changes nothing.
+
+To check it:
+
+```sh
+# every hidg0 handle SerialService holds; "(deleted)" means a replaced node
+adb shell 'ls -l /proc/$(pidof com.baiyi.service.serialservice.serialdataservice)/fd | grep hidg'
+
+# rebuild the gadget twice (not persistent; a reboot restores it)
+adb shell setprop sys.usb.config adb
+adb wait-for-device
+adb shell setprop sys.usb.config hid,adb
+```
+
+If the theory holds, the handle shows `(deleted)` after the rebuild, and
+requests get no reply until `BY_PC_ON` is sent. Several `hidg0` lines after a
+few Info Hub connects would mean each `BY_PC_ON` leaks a handle.
+
 
 ## 2. Frame format
 
