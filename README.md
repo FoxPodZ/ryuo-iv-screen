@@ -1,19 +1,75 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 
-# ryuo-iv-screen
+# ryuo-iv-screen — the ASUS ROG Ryuo IV screen protocol, reverse-engineered
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![AI Contribution](https://raw.githubusercontent.com/Essk/ai-contribution-level/main/badges/level-3.svg)](https://github.com/Essk/ai-contribution-level)
 
-Drive the AMOLED screen on the **ASUS ROG Ryuo IV SLC** AIO cooler from Linux (or Windows, or anything that can open a hidraw node) with **no ASUS software at all**.
+**An independent, hardware-verified description of the USB HID protocol behind
+the AMOLED screen on the ASUS ROG Ryuo IV SLC AIO cooler**, reconstructed from
+the official firmware. Every payload ASUS's own app sends is documented, and
+the handful of things still unresolved are marked as unresolved rather than
+guessed at.
 
-ASUS ships this screen with *Info Hub*, a Windows-only app that isn't part of Armoury Crate and has no Linux counterpart. Without it the screen just loops a stock ASUS video forever. This repo is the result of reverse-engineering the host↔screen protocol so you can push your own telemetry, colours, widgets and media instead.
+**[PROTOCOL.md](PROTOCOL.md) is the point of this repository.** Frame format,
+checksum, byte stuffing, every JSON payload the screen accepts, the widget
+catalogue, the video pipeline and the limits it imposes, the burn-in machinery,
+the OTA path — with the dead ends, the retracted guesses and the bugs in ASUS's
+own renderer written down next to the parts that work. Everything in it was
+worked out from the official 1.0.3 firmware package and confirmed live on the
+cooler with `adb logcat`. No ASUS code is included or redistributed.
 
-Everything here was worked out from the official 1.0.3 firmware package and from `adb logcat` on the cooler itself. No ASUS code is included or redistributed.
+The Python scripts are the **reference implementation**: proof that the write-up
+is right, and a proof of concept that happens to be good enough for daily use.
+No service, no GUI, no installer, no kernel module, and nothing here touches the
+cooler's firmware. If you want to write your own client in another language,
+`ryuo_proto.py` plus PROTOCOL.md are the only two things you need.
+
+*Where this is useful:* ASUS ships the screen with **Info Hub**, a Windows-only
+app that isn't part of Armoury Crate and has no Linux counterpart. Without it
+the panel loops a stock ASUS video forever. With the protocol written down you
+can push your own telemetry, colours, widgets and media from Linux, Windows, or
+anything that can open a hidraw node.
 
 ---
 
-## What works
+## What the teardown turned up
+
+The findings that took the longest to establish, each written up in full:
+
+* **The "screen" is a complete Android 13 computer** — Rockchip RK3562, codename
+  `cm16`, shipped as a full OTA image inside the ASUS firmware zip, with an
+  ODM-built launcher doing the drawing. [§11](PROTOCOL.md#11-device-side-notes)
+* **`adb shell` gives an unauthenticated root prompt**, on a `user/release-keys`
+  build with an unlocked bootloader and no dm-verity. That is the shipped
+  configuration, not an exploit — see the
+  [disclosure note](PROTOCOL.md#disclosure) for why it is stated openly.
+* **The wire format is HTTP-shaped text inside 1024-byte HID reports**, framed
+  with `0x5A` delimiters, byte stuffing and an additive checksum that is not a
+  CRC despite being built by a function called `getCRC()`.
+  [§2](PROTOCOL.md#2-frame-format)
+* **The session is a dead-man's switch.** Stop sending telemetry for ~10 seconds
+  and the screen reverts to stock — which makes a working client look broken the
+  moment you stop to read something. [§10](PROTOCOL.md#10-post-all--telemetry)
+* **Native-resolution video has to be HEVC.** The H.264 decoder declares
+  1920×1088 on a 2240×1080 panel, and an oversized clip black-screens instead of
+  erroring, because playback runs through Rockchip's `rockit` rather than
+  MediaCodec. [§7](PROTOCOL.md#7-the-playmode-trap)
+* **Burn-in protection blanks your widgets for 2 seconds every ~5 minutes**, and
+  a long clip *reduces* the protection rather than the interruptions — the two
+  are keyed to the same boundary. [§7](PROTOCOL.md#7-the-playmode-trap)
+* **Six API fields are dead code**, four readouts render fine but have no tile
+  in ASUS's picker, and two of ASUS's own widgets are visibly buggy.
+  [§4](PROTOCOL.md#4-resources), [§10](PROTOCOL.md#10-post-all--telemetry)
+* **The USB vendor id changes between firmware versions** while the product id
+  stays put, so tools that match on the vendor id stop finding the cooler after
+  an update. [§1](PROTOCOL.md#1-transport)
+
+---
+
+## What the protocol can do, and what the client implements
+
+Everything below is documented in PROTOCOL.md and driven by the scripts here:
 
 | Feature | Status |
 | --- | --- |
