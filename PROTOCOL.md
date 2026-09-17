@@ -924,36 +924,46 @@ which is the textbook burn-in risk. The launcher's mitigation is a small state
 machine that runs on the **media-advance** handler — the same code path that
 picks the next item in a playlist.
 
-Two flags, one timer. In pseudocode — a description of the control flow, not a
-quote:
+Two flags and one timer, per zone. In pseudocode — a description of the control
+flow, not a quote:
 
 ```
-on media advance:
-    if not (nextProtectMode1 and protectBaseTimeout1):
-        show the six widget slots
-        nextProtectMode1 = true
-        play the next media item
+on media advance in a zone:
+    if not (nextProtectMode and protectBaseTimeout):
+        show the zone's widget slots
+        nextProtectMode = true
+        play the zone's next media item
         return
     # both flags set -> protect mode
-    nextProtectMode1 = protectBaseTimeout1 = false
-    cancel and re-arm the 5-minute timer  (message 118, 300 000 ms)
-    hide the six widget slots
-    switch zone 1 to the protect video     (Screensaver.mp4)
-    schedule "advance again" in 2 000 ms   (message 102)
+    nextProtectMode = protectBaseTimeout = false
+    cancel and re-arm the zone's 5-minute timer  (300 000 ms)
+    hide the zone's widget slots
+    play the zone's protect video                (see table below)
+    schedule "advance again" in 2 000 ms
 ```
 
-`isNextProtectMode1` is set on every ordinary advance, so after the first one it
-is effectively always true. `isProtectBaseTimeout1` is set by message **118**,
-the 300 000 ms timer. Protect mode therefore fires on **the first media advance
-after the five-minute timer expires**, and lasts exactly **2 seconds** before
-message 102 re-enters the same handler with both flags cleared and everything
-comes back.
+| Mode | Zone | Advance message | Timer message | Protect video | Slots hidden |
+| --- | --- | --- | --- | --- | --- |
+| Full Screen | 1 | 102 | 118 | `Screensaver.mp4` | all six |
+| Split | 1 — main face | 102 | 118 | `Screensaver_left.mp4` | zone 1's three |
+| Split | 2 — side strip | 117 | 119 | `Screensaver_right.mp4` | zone 2's three |
+
+Zone 1's flags are `isNextProtectMode1` / `isProtectBaseTimeout1`; zone 2 has
+its own `…2` pair. `isNextProtectMode` is set on every ordinary advance, so after
+the first one it is effectively always true. `isProtectBaseTimeout` is set by
+the zone's timer message. Protect mode therefore fires on **the first media
+advance after that zone's five-minute timer expires**, and lasts exactly
+**2 seconds** before the advance message re-enters the same handler with both
+flags cleared and everything comes back.
+
+Both protect videos play through the zone's normal media view (`main_video1` /
+`main_video2`), not through `standby_video`.
 
 Three consequences worth knowing before you file a bug against your own client:
 
-* **Your widgets disappearing for two seconds is normal.** All six slots blank,
-  the panel switches to `Screensaver.mp4`, and then everything returns. Nothing
-  in the protocol caused it and nothing you send can suppress it — there is no
+* **Your widgets disappearing for two seconds is normal.** The slots blank, the
+  zone switches to its protect video, and then everything returns. Nothing in
+  the protocol caused it and nothing you send can suppress it — there is no
   resource for this. It is entirely internal to the launcher.
 * **Long media doesn't reduce interruptions — it reduces *protection*.**
   `MSG_HANDEL_MEDIA` is only posted from `onCompletion` and from the 7 s
@@ -977,20 +987,21 @@ Three consequences worth knowing before you file a bug against your own client:
   the same boundary. If you care about the panel, prefer shorter items or a
   playlist; a single 30-minute clip gives the six text slots half an hour of
   uninterrupted static display at a time.
-* **It is zone 1 only.** `setLayout1Path`, `isNextProtectMode1`,
-  `isProtectBaseTimeout1` — all suffixed `1`, and `standby_video` exists only
-  inside `home_layout1` (see §8). In split mode the side strip does not get a
-  screensaver.
+* **In split mode the two zones blank independently.** Both timers are armed
+  together in `screenConfigChange()`, but each zone re-arms its own when it
+  fires and only checks on its own media advances. A zone with long clips
+  blanks later than one with stills, so the two drift apart.
 
 This is also the same `protectVPath` that `displayInSleep` switches to, which is
 why setting that resource puts `Screensaver.mp4` on screen.
 
 #### Protect mode shows two seconds of an 11.9-second clip
 
-The protect branch plays `Screensaver.mp4` and then posts message 102 again
-after **2000 ms**, which switches straight back to your media. The clip is
-**11.9 seconds long**, so protect mode only ever shows its first ~2 seconds
-— every five minutes, the same opening moment, cut off.
+In full-screen mode the protect branch plays `Screensaver.mp4` and then posts
+message 102 again after **2000 ms**, which switches straight back to your media.
+The clip is **11.9 seconds long**, so protect mode only ever shows its first ~2
+seconds — every five minutes, the same opening moment, cut off. The split-mode
+clips get the same 2 seconds; their lengths haven't been measured.
 
 There is nothing hidden in the rest of it. `Screensaver.mp4` is not unique
 content — it plays the same video as one of the `RYUO_IV_HW_Info_*.mp4` presets (see
@@ -1017,13 +1028,15 @@ symptom if you don't know:
 | View | Plays | When |
 | --- | --- | --- |
 | `standby_video` | `standby.mp4` | no `ScreenConfig` has been received, or the session lapsed (§10) |
-| `standby_video` | `Screensaver.mp4` | burn-in protection kicks in |
+| `standby_video` | `Screensaver.mp4` | the `displayInSleep` path (§4) |
+| `main_video1` | `Screensaver.mp4`, or `Screensaver_left.mp4` in split mode | burn-in protection, 2 s |
+| `main_video2` | `Screensaver_right.mp4` | burn-in protection in split mode, 2 s |
 | `main_video1` / `main_video2` | your `media[]` | normal operation |
 
-`Screensaver.mp4` is **burn-in protection**, not an idle animation — the field
-is called `protectVPath`, and it's driven by `sendEmptyMessageDelayed(118,
-300000L)` five-minute timers armed in `screenConfigChange()`. It's an AMOLED;
-that's what those are for.
+The `Screensaver*.mp4` clips are **burn-in protection**, not an idle animation —
+the fields are called `protectVPath`, `protectVLPath` and `protectVRPath`, and
+they're driven by five-minute timers (messages 118 and 119, one per zone) armed
+in `screenConfigChange()`. It's an AMOLED; that's what those are for.
 
 The trap: `Screensaver.mp4` is not its own clip — on **firmware 1.0.7** it plays
 the same content as `RYUO_IV_HW_Info_02.mp4`, one of the stock presets (same
@@ -1033,16 +1046,16 @@ the same clip rather than a copy — which changes nothing about how it looks). 
 `RYUO_IV_HW_Info_05.mp4`; see §10b. Check your own unit
 rather than trusting either statement. If the preset the screensaver copies
 happens to be your selected media, "the screensaver is playing" and "my
-configured video is playing" look exactly the same while being two different
-views on two different code paths. Change your media to something else before
+configured video is playing" look exactly the same while coming from different
+code paths. Change your media to something else before
 concluding anything about standby behaviour.
 
 `adb reboot` clears the held config, which makes it a clean reset to the
 `standby.mp4` state for testing.
 
-`Screensaver_left.mp4` and `Screensaver_right.mp4` are declared as
-`protectVLPath` / `protectVRPath` and **never referenced anywhere in the app**.
-Dead fields; ASUS ships ~25 MB of unused video on every unit.
+`Screensaver_left.mp4` and `Screensaver_right.mp4` are the split-mode protect
+clips: zone 1 plays the left one and zone 2 the right one when their protect
+cycles fire (see the table under "Burn-in protection" above).
 
 ---
 
@@ -1133,13 +1146,12 @@ depending on what you put in it.
 ### Only zone 1 gets a standby video
 
 `standby_video` lives inside `home_layout1` only — there is no second standby
-view. The burn-in state machine agrees: every flag and setter in it is suffixed
-`1` (`isNextProtectMode1`, `setLayout1Path`), so in split mode the side strip
-never gets a screensaver. See §7 for how that cycle works.
+view. It doesn't need one: showing standby hides `home_layout2`, so zone 1
+takes the whole panel.
 
-That is very likely why `Screensaver_left.mp4` and `Screensaver_right.mp4` exist
-as separate files, and why the path looks half-wired: somebody intended to
-protect both zones and only one got built.
+Burn-in protection is separate and does cover both zones. It plays through each
+zone's own media view, with `Screensaver_left.mp4` on the main face and
+`Screensaver_right.mp4` on the side strip. See §7 for how that cycle works.
 
 ---
 

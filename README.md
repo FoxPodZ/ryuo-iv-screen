@@ -336,8 +336,10 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
   why: Info Hub was supplying the keepalive.
 * **Your widgets will vanish for 2 seconds every ~5 minutes.** That's the OLED
   burn-in protection, not your client misbehaving: all six slots blank, the
-  panel plays `Screensaver.mp4`, then everything returns. There's no way to turn
-  it off — it's internal to the launcher.
+  panel plays `Screensaver.mp4`, then everything returns. In split mode each
+  zone does this on its own timer, with `Screensaver_left.mp4` and
+  `Screensaver_right.mp4`. There's no way to turn it off — it's internal to the
+  launcher.
 * **Long clips quietly disable that protection.** The check only runs when media
   advances, so a 30-minute clip means the protect cycle fires every 30 minutes
   instead of every 5 — while the static widget text sits there unchanged the
