@@ -34,6 +34,7 @@ Everything here was worked out from the official 1.0.3 firmware package and from
 | Animated overlay filter | ✅ — any non-empty `filter.value` turns it on; you can't pick which effect |
 | Media *upload* over the HID envelope | ⚠️ framing understood, not implemented — just `adb push` instead |
 | AMD GPU telemetry | ⚠️ only NVIDIA (`nvidia-smi`) is wired up so far |
+| CPU temperature & fan speeds on Windows | ⚠️ Linux only — deliberately; see *Known limits* below |
 
 ---
 
@@ -358,6 +359,22 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
   `Memory Utilization`, `Memory Frequency` and `Hard Disk Temperature`. All
   four render perfectly; Info Hub simply never offers them.
 * **GPU stats are NVIDIA-only** right now, via `nvidia-smi`. AMD would want a `sysfs`/`amdgpu` path in `_nvidia()`'s place. PRs welcome.
+* **CPU temperature and fan speeds are Linux-only.** Both come from `psutil`,
+  which only reads hardware sensors on Linux and FreeBSD. On Windows the
+  `CPU Temperature` slot shows 0, and `Fan Speed …` slots get no data except
+  what you pass with `--readout`. GPU temperature isn't affected: it comes from
+  `nvidia-smi`, which works on both.
+
+  This is deliberate. Windows has no built-in API that reliably reports the
+  CPU's temperature. The one that exists, `MSAcpi_ThermalZoneTemperature`,
+  needs admin and on most desktop boards returns a fixed or motherboard value.
+  The real reading needs a kernel driver, which in practice means depending on
+  a monitoring app such as LibreHardwareMonitor or HWiNFO, or loading that
+  driver yourself as admin. That driver layer is also where the trouble has
+  been: WinRing0, the driver most of these tools used for years, is now flagged
+  by Microsoft Defender. This project stays at `hidapi` + `psutil`, with no
+  admin rights and no third-party app, so on Windows the slot stays at 0
+  rather than pulling any of that in.
 * **Don't try to downgrade the firmware.** Info Hub will happily accept an older
   official firmware file and start the update — it has no downgrade check. The
   device does: recovery rejects it with `E3003` and nothing gets flashed, but
