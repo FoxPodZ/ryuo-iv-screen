@@ -33,7 +33,7 @@ Everything here was worked out from the official 1.0.3 firmware package and from
 | Fan LCD | ⚠️ ACK, no observed effect |
 | Animated overlay filter | ✅ — any non-empty `filter.value` turns it on; you can't pick which effect |
 | Media *upload* over the HID envelope | ⚠️ framing understood, not implemented — just `adb push` instead |
-| AMD GPU telemetry | ⚠️ only NVIDIA (`nvidia-smi`) is wired up so far |
+| AMD / Intel GPU telemetry | ✅ Linux via sysfs; on Windows any vendor gives temperature + fan, no load |
 | CPU temperature & fan speeds on Windows | ⚠️ Linux only — deliberately; see *Known limits* below |
 
 ---
@@ -304,6 +304,7 @@ python ryuo_ctl.py raw POST temperature '{"value":"Fahrenheit"}'
 | `PROTOCOL.md` | Full protocol writeup. |
 | `70-ryuo.rules` | udev rule so you don't have to run as root. The number is load-bearing — `uaccess` tags are only honoured by rule files sorting before systemd's `73-seat-late.rules`. |
 | `tests/test_proto.py` | Codec tests — framing, stuffing, checksum, payload shapes. No hardware needed. |
+| `tests/test_gpu.py` | GPU telemetry tests — sysfs parsing against fake trees, source precedence, and the Windows D3DKMT path where it exists. No hardware needed. |
 | `tests/probe.py` | Interactive harness for the unknowns in PROTOCOL.md. Sends one request at a time and writes down what you saw. |
 | `tests/video_matrix.py` | Works out which video encodes actually play, holding the session open so a timeout can't masquerade as a decode failure. |
 | `captures/` | Raw evidence — Info Hub logcats, the recovery transcript, the split-zone measurement — that the docs are checked against. |
@@ -358,7 +359,27 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
 * **Four readouts have no tile in ASUS's picker at all** — `GPU Power`,
   `Memory Utilization`, `Memory Frequency` and `Hard Disk Temperature`. All
   four render perfectly; Info Hub simply never offers them.
-* **GPU stats are NVIDIA-only** right now, via `nvidia-smi`. AMD would want a `sysfs`/`amdgpu` path in `_nvidia()`'s place. PRs welcome.
+* **How much GPU telemetry you get depends on the card and the system.**
+  Three sources, tried in this order:
+
+  | Source | Where | Reports |
+  | --- | --- | --- |
+  | `nvidia-smi` | NVIDIA, any system | load, temperature, fan, clock, power |
+  | sysfs — `amdgpu`, `i915`, `xe` | Linux | temperature, fan, clock and power, plus load on AMD |
+  | D3DKMT | Windows, any vendor | temperature and fan only |
+
+  Intel needs a discrete card and a recent kernel — `i915` gained a GPU
+  temperature in 6.12 and `xe` in 6.15 — because an integrated Intel GPU has
+  no temperature of its own; it sits on the CPU package. Intel GPU load isn't
+  readable without elevated privileges, so it stays 0.
+
+  On Windows the fallback is `D3DKMTQueryAdapterInfo`, the same interface Task
+  Manager reads its GPU temperature from: no admin rights, no kernel driver
+  and no third-party app, matching the line drawn for CPU temperature above.
+  The trade is that it reports no load (that lives in the "GPU Engine"
+  performance counters), no core clock, and power only as a percentage of the
+  card's limit rather than watts — so those stay 0. Filling them in would
+  need AMD's ADLX or Intel's IGCL. PRs welcome.
 * **CPU temperature and fan speeds are Linux-only.** Both come from `psutil`,
   which only reads hardware sensors on Linux and FreeBSD. On Windows the
   `CPU Temperature` slot shows 0, and `Fan Speed …` slots get no data except
@@ -433,6 +454,36 @@ pytest tests/ -v                       # codec tests, no hardware needed
 `tests/test_proto.py` pins the wire format, including the worked example printed
 in PROTOCOL.md §2 as a golden vector — if the doc and the code ever drift apart,
 that test fails.
+
+`tests/test_gpu.py` covers the GPU telemetry sources. The Linux path runs
+against fake sysfs trees, so an AMD or Intel card isn't needed to test it — or
+a Linux machine. The two Windows checks skip themselves elsewhere, and one test
+reads whatever GPU is actually in the machine and checks the numbers are
+plausible.
+
+**No cooler needed for that one.** The same file runs directly as a probe, so
+you can check a GPU or a kernel this repo hasn't seen on any machine you have:
+
+```bash
+python tests/test_gpu.py
+```
+
+It prints what each source reports there and which one `ryuo_send` would use,
+and it needs nothing installed but Python — not even pytest, and not hidapi:
+
+```
+Linux, x86_64
+
+nvidia-smi     --
+sysfs          AMD Graphics
+               temp=61C load=37% fan=1320rpm clock=2400MHz power=142W
+d3dkmt         --
+ryuo_send uses AMD Graphics
+               temp=61C load=37% fan=1320rpm clock=2400MHz power=142W
+```
+
+A source that isn't available prints `--`: sysfs is Linux-only, D3DKMT is
+Windows-only, and `nvidia-smi` needs an NVIDIA card.
 
 For the things only hardware can answer:
 

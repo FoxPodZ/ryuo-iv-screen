@@ -37,6 +37,9 @@ stops hearing from us for ~10 s, so the loop is the keepalive.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import glob
+import os
 import platform
 import shutil
 import subprocess
@@ -169,6 +172,286 @@ def _nvidia() -> dict:
                       "load": _num(util), "temperature": _num(temp),
                       "fan": _num(fan), "speed": _num(clock),
                       "power": _num(power), "voltage": 0}}
+
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _read_num(path: str, scale: float = 1.0) -> int:
+    raw = _read(path)
+    try:
+        return int(float(raw) / scale)
+    except (TypeError, ValueError):
+        return 0
+
+
+# PCI vendor ids as /sys/class/drm/card*/device/vendor spells them. NVIDIA
+# (0x10de) is deliberately absent -- nvidia-smi reports far more than sysfs.
+_GPU_VENDORS = {"0x1002": "AMD Graphics", "0x8086": "Intel Graphics"}
+
+_DRM_ROOT = "/sys/class/drm"      # overridden in tests
+
+_GPU_SYSFS: tuple[str, str, str] | None | bool = False   # False = not looked up
+
+
+def _candidate_gpus():
+    """(hwmon dir, device dir, display name) for every AMD/Intel GPU."""
+    for card in sorted(glob.glob(os.path.join(_DRM_ROOT, "card[0-9]*"))):
+        dev = os.path.join(card, "device")
+        name = _GPU_VENDORS.get(_read(os.path.join(dev, "vendor")) or "")
+        if not name:
+            continue
+        for hwmon in sorted(glob.glob(os.path.join(dev, "hwmon", "hwmon[0-9]*"))):
+            yield hwmon, dev, name
+
+
+def _sysfs_stats(card: tuple[str, str, str]) -> dict:
+    """Read one card, or {} if it has nothing worth sending.
+
+    The temperature is the lowest-numbered sensor the card offers, which is
+    the one you want on all three drivers: amdgpu's temp1 is the edge sensor,
+    i915's is temp1, and xe starts at temp2 (its package sensor).
+    """
+    hwmon, dev, name = card
+    temp = 0
+    for i in range(1, 4):
+        temp = _read_num(os.path.join(hwmon, f"temp{i}_input"), 1000)
+        if temp:
+            break
+
+    load = _read_num(os.path.join(dev, "gpu_busy_percent"))
+    if not temp and not load:
+        # hwmon is there but has nothing we can use -- an integrated Intel
+        # GPU, or a kernel too old for the temperature. Report no GPU rather
+        # than a GPU that reads 0 everywhere.
+        return {}
+
+    power = _read_num(os.path.join(hwmon, "power1_average"), 1_000_000)
+    return {"name": name,
+            "stats": {"hasDedicated": True,
+                      "load": load,
+                      "temperature": temp,
+                      "fan": _read_num(os.path.join(hwmon, "fan1_input")),
+                      "speed": _read_num(os.path.join(hwmon, "freq1_input"),
+                                         1_000_000),
+                      "power": power or _read_num(
+                          os.path.join(hwmon, "power1_input"), 1_000_000),
+                      "voltage": 0}}
+
+
+def _gpu_sysfs() -> dict:
+    """GPU stats from Linux sysfs: AMD, and discrete Intel cards.
+
+    `amdgpu` puts temperature, fan, power and clock in hwmon, with the load
+    counter next to it in `gpu_busy_percent`. Intel exposes much less: `i915`
+    gained a GPU temperature in kernel 6.12 and `xe` in 6.15, both only on
+    discrete cards -- an integrated Intel GPU has no temperature of its own,
+    it sits on the CPU package. Neither Intel driver has a load counter
+    readable without elevated privileges, so load stays 0 there.
+
+    A machine can present several of these, and the first one is not
+    necessarily the one that answers: an integrated GPU still gets an hwmon
+    directory, it just has nothing readable in it. So the first probe walks
+    them all and keeps whichever actually reports something.
+    """
+    global _GPU_SYSFS
+    if _GPU_SYSFS is False:
+        _GPU_SYSFS = next((c for c in _candidate_gpus() if _sysfs_stats(c)),
+                          None)
+    return _sysfs_stats(_GPU_SYSFS) if _GPU_SYSFS else {}
+
+
+# D3DKMT, the interface Task Manager reads its GPU temperature from.
+_KMTQAITYPE_ADAPTERREGISTRYINFO = 8
+_KMTQAITYPE_ADAPTERTYPE = 15
+_KMTQAITYPE_ADAPTERPERFDATA = 62
+_MAX_PATH = 260
+
+# D3DKMT_ADAPTERTYPE bitfields, in declaration order.
+_ADAPTER_SOFTWARE = 1 << 2
+_ADAPTER_HYBRID_DISCRETE = 1 << 4
+_ADAPTER_HYBRID_INTEGRATED = 1 << 5
+_ADAPTER_INDIRECT_DISPLAY = 1 << 6
+_ADAPTER_PARAVIRTUALIZED = 1 << 7
+_ADAPTER_NOT_A_GPU = (_ADAPTER_SOFTWARE | _ADAPTER_INDIRECT_DISPLAY
+                      | _ADAPTER_PARAVIRTUALIZED)
+
+# which adapter to believe when several report a temperature
+_ADAPTER_RANK_INTEGRATED = 0
+_ADAPTER_RANK_PLAIN = 1
+_ADAPTER_RANK_DISCRETE = 2
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_ulong), ("HighPart", ctypes.c_long)]
+
+
+class _ADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint32),
+                ("AdapterLuid", _LUID),
+                ("NumOfSources", ctypes.c_ulong),
+                ("bPrecisePresentRegionsPreferred", ctypes.c_int)]
+
+
+class _ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [("NumAdapters", ctypes.c_ulong),
+                ("pAdapters", ctypes.POINTER(_ADAPTERINFO))]
+
+
+class _QUERYADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint32),
+                ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", ctypes.c_uint)]
+
+
+class _CLOSEADAPTER(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint32)]
+
+
+class _ADAPTER_PERFDATA(ctypes.Structure):
+    """d3dkmthk.h. Temperature is deci-Celsius, Power is tenths of a percent."""
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32),
+                ("MemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequencyOC", ctypes.c_uint64),
+                ("MemoryBandwidth", ctypes.c_uint64),
+                ("PCIEBandwidth", ctypes.c_uint64),
+                ("FanRPM", ctypes.c_ulong),
+                ("Power", ctypes.c_ulong),
+                ("Temperature", ctypes.c_ulong),
+                ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+class _ADAPTERTYPE(ctypes.Structure):
+    _fields_ = [("Value", ctypes.c_uint32)]
+
+
+class _ADAPTERREGISTRYINFO(ctypes.Structure):
+    _fields_ = [("AdapterString", ctypes.c_wchar * _MAX_PATH),
+                ("BiosString", ctypes.c_wchar * _MAX_PATH),
+                ("DacType", ctypes.c_wchar * _MAX_PATH),
+                ("ChipType", ctypes.c_wchar * _MAX_PATH)]
+
+
+def _d3dkmt_query(query_info, handle: int, kind: int, out) -> bool:
+    """One D3DKMTQueryAdapterInfo call into `out`. True if it succeeded."""
+    info = _QUERYADAPTERINFO(
+        hAdapter=handle, Type=kind,
+        pPrivateDriverData=ctypes.cast(ctypes.byref(out), ctypes.c_void_p),
+        PrivateDriverDataSize=ctypes.sizeof(out))
+    return query_info(ctypes.byref(info)) == 0
+
+
+def _gpu_d3dkmt() -> dict:
+    """GPU temperature and fan on Windows, for any vendor.
+
+    `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` is where Task
+    Manager gets its GPU temperature. It runs in user mode out of gdi32, so
+    this needs no admin rights, no kernel driver of ours and no third-party
+    monitoring app -- the same line drawn for CPU temperature in the README.
+
+    What it does NOT give is load (that lives in the "GPU Engine" performance
+    counters), a core clock (`MemoryFrequency` is the memory clock, which is a
+    different number -- reporting it as `speed` would be a lie) or power in
+    watts (`Power` is tenths of a percent of the card's limit). Those stay 0.
+
+    Picking the adapter is the fiddly part, because plenty of things that
+    aren't your graphics card enumerate here. Measured on a hybrid desktop:
+    a virtual-monitor driver (flagged `IndirectDisplayDevice`) mirrored the
+    real card's temperature but could not name itself, the WARP software
+    renderer appeared as `SoftwareDevice`, and the integrated Radeon reported
+    a genuine 40C next to the discrete card's 54.5C. So software, indirect
+    and paravirtualized adapters are dropped outright, and what remains is
+    ranked discrete > plain > integrated, then by having a name, then by
+    temperature. A card whose driver reports no temperature at all (WDDM
+    older than 2.4) drops out with it.
+
+    This is a driver-facing interface rather than a stable application API,
+    so the struct goes in with an explicit size and anything unexpected
+    degrades to "no GPU" instead of raising.
+    """
+    if platform.system() != "Windows":
+        return {}
+    try:
+        gdi32 = ctypes.WinDLL("gdi32")
+        enum_adapters = gdi32.D3DKMTEnumAdapters2
+        query_info = gdi32.D3DKMTQueryAdapterInfo
+        close_adapter = gdi32.D3DKMTCloseAdapter
+    except (AttributeError, OSError):
+        return {}
+
+    try:
+        # first call with a null array asks how many adapters there are
+        desc = _ENUMADAPTERS2()
+        if enum_adapters(ctypes.byref(desc)) != 0 or not desc.NumAdapters:
+            return {}
+        adapters = (_ADAPTERINFO * desc.NumAdapters)()
+        desc.pAdapters = ctypes.cast(adapters, ctypes.POINTER(_ADAPTERINFO))
+        if enum_adapters(ctypes.byref(desc)) != 0:
+            return {}
+
+        best = None
+        for i in range(desc.NumAdapters):
+            handle = adapters[i].hAdapter
+            try:
+                kind = _ADAPTERTYPE()
+                if not _d3dkmt_query(query_info, handle,
+                                     _KMTQAITYPE_ADAPTERTYPE, kind):
+                    continue
+                if kind.Value & _ADAPTER_NOT_A_GPU:
+                    continue
+                perf = _ADAPTER_PERFDATA()
+                if not _d3dkmt_query(query_info, handle,
+                                     _KMTQAITYPE_ADAPTERPERFDATA, perf):
+                    continue
+                if not perf.Temperature:
+                    continue
+                reg = _ADAPTERREGISTRYINFO()
+                name = (reg.AdapterString
+                        if _d3dkmt_query(query_info, handle,
+                                         _KMTQAITYPE_ADAPTERREGISTRYINFO, reg)
+                        else "")
+                rank = (_ADAPTER_RANK_DISCRETE
+                        if kind.Value & _ADAPTER_HYBRID_DISCRETE
+                        else _ADAPTER_RANK_INTEGRATED
+                        if kind.Value & _ADAPTER_HYBRID_INTEGRATED
+                        else _ADAPTER_RANK_PLAIN)
+                score = (rank, bool(name), perf.Temperature)
+                if best is None or score > best[0]:
+                    best = (score, perf, name)
+            finally:
+                # the handles EnumAdapters2 returns are ours to close, and
+                # this runs once a second -- leaking them is not an option
+                close_adapter(ctypes.byref(_CLOSEADAPTER(handle)))
+    except Exception:
+        return {}
+
+    if best is None:
+        return {}
+    _, perf, name = best
+    return {"name": name,
+            "stats": {"hasDedicated": True,
+                      "load": 0,
+                      "temperature": perf.Temperature // 10,
+                      "fan": int(perf.FanRPM),
+                      "speed": 0, "power": 0, "voltage": 0}}
+
+
+def _gpu() -> dict:
+    """GPU stats from whatever this machine can actually answer with.
+
+    nvidia-smi first, since it reports the most; then the platform fallback.
+    Each of these returns {} when it has nothing, and so does this, which is
+    what makes collect() fall back to hasDedicated=False.
+    """
+    return _nvidia() or (_gpu_d3dkmt() if platform.system() == "Windows"
+                         else _gpu_sysfs())
 
 
 def _cpu_temp(psutil) -> tuple[float, float]:
@@ -339,7 +622,7 @@ def main() -> None:
     if args.shuffle:
         play_mode = proto.PLAY_RANDOM
 
-    gpu = _nvidia()
+    gpu = _gpu()
     readouts = {}
     for spec in args.readout:
         if "=" not in spec:
@@ -415,8 +698,8 @@ def main() -> None:
             # telemetry on its own cadence
             if now >= next_stats:
                 # re-poll the GPU every tick; `gpu` from before the loop is
-                # only a fallback for when nvidia-smi isn't there at all
-                last_stats = collect(psutil, _nvidia() or gpu, readouts)
+                # only a fallback for when nothing can read one at all
+                last_stats = collect(psutil, _gpu() or gpu, readouts)
                 reply = txn(h, proto.POST, proto.RES_ALL, last_stats,
                             seq, verbose=args.verbose)
                 if args.verbose:
