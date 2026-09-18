@@ -191,10 +191,19 @@ Header keys (`DataHeader` fields — any field set to `-1` is omitted rather tha
 | `AckNumber` | device echoes `SeqNumber + 1` |
 | `ContentLength` | byte length of the payload |
 | `ContentType` | always `json` in practice |
-| `FileName`, `FileSize`, `ContentRange` | chunked media upload over this same envelope |
+| `FileName`, `FileSize`, `ContentRange` | in the schema, never read. There is no upload over HID — see `transport` in §4 |
 | `Counter`, `Date`, `msgId` | seen in the schema, unused by the paths documented here |
 
 Payload is JSON, `ContentLength` bytes of it.
+
+Of all these, `SerialService` reads exactly one from an incoming request:
+`SeqNumber`, to build the `AckNumber` of its reply. *Read from source.*
+
+> **Retracted.** Earlier versions of this document said media upload runs over
+> this envelope using the `FileName` / `FileSize` / `ContentRange` headers.
+> Nothing on the device reads those headers, and the one handler shaped like
+> an upload never receives any data (§4, `transport`). Media goes on with
+> `adb push`.
 
 ---
 
@@ -217,16 +226,28 @@ Everything `MsgReceiverManager` dispatches on:
 | `waterBlockScreenId` | a full `ScreenConfig` — same shape as `preset` | 📖 payload read from source, untested |
 | `power` | `{"event": "shutdown"}` dims the panel. Which event, if any, restores it is unresolved — see below | ✅ tested on device |
 | `fanLCD` / `fanLCDSet` | `{"speed": str, "mode": str}`; the `FanLCD` entity also has `fixedMode` (int) and `smartMode` (`int[][]`) | 📖 payload read from source, untested |
-| `upgrade` | an update zip — the handler just logs `update.zip save!!!` and stages it. Signature-checked in recovery; downgrades rejected there (E3003), not by Info Hub | ☠️ **do not poke** |
+| `upgrade` | `{"enable": true}` — no package travels over HID. `SerialService` tells `RKUpdateService` to start an update; HomeUI only logs `update.zip save!!!`. Signature-checked in recovery; downgrades rejected there (E3003), not by Info Hub | ☠️ **do not poke** |
 | `rotate` | `{"degree": <int>}` — writes `persist.vendor.orientation`; the property sticks, the panel does not turn | 💀 **dead, confirmed on device** |
 | `waterfallMode` | `{"enable": bool}` — parsed and dispatched, handler logs and returns | 💀 **dead, not unknown** |
+
+Five more are handled by `SerialService` itself, before HomeUI is involved.
+It still forwards every one except `conn` to HomeUI, which ignores them:
+
+| Resource | Payload | Status |
+| --- | --- | --- |
+| `conn` | none — replies with capabilities, versions, serial number and both media listings (see below) | ✅ tested on device (fw 1.0.10) |
+| `mediaDelete` | `{"include": [names]}` deletes those from `pcMedia/`; `{"exclude": [names]}` deletes everything else there | ✅ `include` tested on device; 📖 `exclude` read from source |
+| `transport` | `{"fileName", "fileSize", "type"}` — replies `success` and receives nothing. **There is no upload over HID** | 💀 **stub, confirmed on device** |
+| `transported` | `{"fileName", "md5"}` — no reply. With `type` `"firmware"` it starts `RKUpdateService`'s local update check | 💀 for media; ☠️ for `"firmware"` |
+| `turboPump` | `{"enable": bool, "value": int}` — writes to a pump driver this board doesn't have | 💀 **no driver on this board** (checked over adb) |
 
 > ⚠️ **`1 200` does not mean "accepted".** This device replies `1 200` to every
 > well-formed frame, including resources it ignores and payload shapes it has no
 > field for. `rotate` returns 200 for `{"value": 90}`, `{"angle": 90}`,
 > `{"rotate": 90}` and `{"value": "90"}` alike and does nothing for any of them.
 > The status confirms the *framing* parsed. Nothing more. Only the panel tells
-> you whether something worked.
+> you whether something worked. (The one exception found so far runs the other
+> way: `transported` doesn't reply at all.)
 
 **Five markers, and they mean different things.**
 
@@ -496,6 +517,96 @@ do not exist (§10) — but the `type` field is real and undocumented regardless
 If the device doesn't hear from the host for roughly **10 seconds**, it drops to standby: the widget labels and values disappear, the panel dims (by an amount nobody has measured yet), and `standby.mp4` plays until something talks to it again — the same state as a fresh boot. There is no persistent-config mode: whatever is driving the screen has to keep sending. `POST all` on a 1 s interval doubles as the heartbeat.
 
 On a clean shutdown, send `POST disconn` so it reverts immediately instead of showing a stale frame for ten seconds.
+
+### `conn` — capabilities, versions and the media listing
+
+`POST conn` with no body. The reply, from firmware 1.0.10 via
+`tests/probe.py --only conn_handshake`, with the serial number and the
+`custom` list elided:
+
+```json
+{"attribute": ["Status", "Water Block Screen", "Fan LCD|rw"],
+ "OS": "Android",
+ "productId": "cm16",
+ "product": "Ryuo IV Standard",
+ "version": {"app": "null", "firmware": "V1.0.10", "hardware": "V1.1"},
+ "media": {"preset": ["RYUO_IV_HW_Info_01.mp4", "RYUO_IV_HW_Info_02.mp4",
+                      "RYUO_IV_HW_Info_03.mp4", "RYUO_IV_HW_Info_04.mp4",
+                      "RYUO_IV_HW_Info_05.mp4"],
+           "custom": ["…"]},
+ "sn": "<serial>"}
+```
+
+* **`media`** is a listing of `sdcard/pcMediaPreset/` and `sdcard/pcMedia/`.
+  On the test unit `custom` matched `adb shell ls /sdcard/pcMedia/` exactly, so
+  you can see what's on the device without adb. `ryuo_ctl.py ls` prints it.
+* **`sn`** is the unit's serial number. `ryuo_ctl.py info` blanks it unless
+  you pass `--serial`, since this output tends to end up in issues.
+* **`product`** comes from `ro.product.version`. The code knows three values:
+  `Ryuo IV Standard`, `Ryuo IV MIKU ACC` and `Ryuo IV MIKU WW`.
+* **`version.app`** reads the version of a package that isn't installed on
+  this cooler, so it is always `"null"`. `firmware` is the build's display ID,
+  `hardware` is `ro.hwversion`.
+* **`attribute`** is a fixed list, plus `"Turbo Pump"` when the board's pump
+  driver reports 3200 RPM or more. This board has no such driver (see
+  `turboPump` below), so it never appears. Per the source, the handler also
+  sleeps 200 ms before replying when it has no pump reading, so expect `conn`
+  to be slower to answer than anything else.
+
+Nothing changed on screen when it was sent, and none of the other scripts here
+need it.
+
+### `mediaDelete` — deleting from `pcMedia/`
+
+```json
+{"include": ["a.mp4", "b.png"]}   // delete exactly these
+{"exclude": ["keep.mp4"]}         // delete everything in pcMedia/ except these
+```
+
+`include` is confirmed on firmware 1.0.10: three throwaway files, one named,
+one deleted, two left. `exclude` is read from source and deliberately not
+probed — on a real unit it deletes your own media. It is presumably how a host
+syncs the folder to its own library.
+
+`exclude` only ever walks `sdcard/pcMedia/`. `include` appends each name to
+`sdcard/pcMedia/` as-is, so send bare file names; `ryuo_ctl.py rm` refuses
+anything with a path separator in it. With bare names, the presets in
+`pcMediaPreset/` are out of reach of both. The reply is `1 200` whether or not
+a file existed.
+
+### `transport` / `transported` — an upload with nothing behind it
+
+The names, the `fileName` / `fileSize` fields and a reply advertising a
+`blockMaxSize` all say "upload". On this firmware it isn't one. Confirmed on
+1.0.10 with `tests/probe.py --only transport_stub`:
+
+* **`transport`** `{"fileName": str, "fileSize": int, "type": str}` replies
+  `{"state": "success", "blockMaxSize": 888888888}` and stores the three
+  fields. It creates no file, and the device never switches into receiving
+  data: the widgets kept updating afterwards, and no file appeared in
+  `pcMedia/`.
+* **`transported`** `{"fileName": str, "md5": str}` sends **no reply** — the
+  only resource found so far that doesn't answer. The md5 is read and
+  discarded. If the name matches the last `transport` and its `type` was
+  `"firmware"`, it starts `RKUpdateService`'s check for a local update
+  package — the same signature-checked path as `upgrade` (§11). Nothing in
+  this repository sends that type.
+* **Don't follow `transport` with raw file data.** A data frame goes to the
+  ordinary command parser, which expects header lines; per the source it
+  throws on a frame without them. Not tried, on purpose.
+
+So there's no way to put media on the device over HID. `adb push` to
+`/sdcard/pcMedia/` (§7) is the way; `conn` and `mediaDelete` above cover
+listing and removing.
+
+### `turboPump` — a pump driver that isn't there
+
+`{"enable": bool, "value": int}` writes to an I²C pump driver in sysfs,
+`/sys/bus/i2c/drivers/aio_cooler/`. That directory doesn't exist on the Ryuo IV
+screen board (checked over adb, firmware 1.0.10), so the writes fail — and per
+the source, the handler replies `1 200` regardless. It matches the hardware:
+the pump runs off the motherboard's `AIO_PUMP` header like any fan, and the
+screen board has no connection to it. Pump speed stays the motherboard's job.
 
 ---
 
@@ -1247,6 +1358,17 @@ and the disk speed fields were flat zero throughout — Info Hub sends the keys
 whether or not it has a value for them. Send them as `0` rather than omitting
 them.
 
+The reply isn't a bare ACK. On firmware 1.0.10, every `POST all` came back as
+`1 200` with a body:
+
+```json
+{"status": {"fanLCD": ""}}
+```
+
+What would fill `fanLCD`, or what `status` might carry on other hardware, is
+unknown. The `"Status"` entry in `conn`'s attribute list (§4) presumably refers
+to this.
+
 Units are the part that bites:
 
 | Field | Unit |
@@ -1671,8 +1793,8 @@ unauthenticated root `adb` shell, on a board whose verified-boot state is
 **orange** — bootloader unlocked, no secure boot, no dm-verity, and the
 RK3562's maskrom mode reachable. Those are choices made on top of a production
 configuration, not a debug build that escaped. The one thing that *is* locked
-down is the OTA path: `upgrade` hands a package to recovery, and recovery
-checks the signature and the timestamp (§10b). Everything below that layer is
+down is the OTA path: `upgrade` sets off an update, and recovery checks the
+package's signature and timestamp (§10b). Everything below that layer is
 open.
 
 ## 11. Device-side notes
@@ -1706,10 +1828,11 @@ Things that are true about the board but aren't part of the protocol:
   (older scrcpy spells it `--encoder`). The decode side of the same asymmetry is
   why native-resolution video has to be HEVC — see §7.
 * **You cannot install APKs.** The bundled PackageInstaller ships *only* `.UninstallActivity`. `pm install` verifies, stages and commits the session fine, then hangs forever waiting on a confirmation callback whose activity doesn't exist. No timeout, no error. Custom launchers and third-party apps are simply off the table.
-* **hwmon has nothing useful**: `soc_thermal` plus factory test stubs (`test_ac`, `test_battery`, `test_usb`). No pump, fan or coolant sensor readable on-device — that's why all cooler telemetry has to come from the host.
+* **hwmon has nothing useful**: `soc_thermal` plus factory test stubs (`test_ac`, `test_battery`, `test_usb`). No pump, fan or coolant sensor readable on-device — that's why all cooler telemetry has to come from the host. `SerialService` does carry a `turboPump` handler for an `aio_cooler` I²C pump driver (§4), but that driver isn't on this board either.
 * The factory app (`com.baiyi.app.factorymode`) is Chinese-only, which is a nice confirmation of the Baiyi ODM origin.
-* **The `upgrade` resource stages an update zip** handed to `RKUpdateService`,
-  which verifies against the bundled `otacert` in recovery. That is the official
+* **The `upgrade` resource starts an update in `RKUpdateService`**, which
+  verifies the package against the bundled `otacert` in recovery. The package
+  itself never travels over HID. That is the official
   way firmware gets on the device, and it is properly gated: a package needs
   ASUS's private key and a newer timestamp than what is running.
 
@@ -1750,7 +1873,9 @@ Things that are true about the board but aren't part of the protocol:
     menu's "Reboot system now", and the device comes back untouched. Do not
     take the fastboot option to see what it does. There is no published
     firmware image for this board and no unbrick path.
-* **MTP is not enabled on the gadget.** Media upload goes through the HID envelope's `FileName` / `FileSize` / `ContentRange` headers — or, much more easily, `adb push` to `/sdcard/pcMedia/`.
+* **MTP is not enabled on the gadget, and there is no upload over HID** —
+  `transport` is a stub (§4). Media goes on with `adb push` to
+  `/sdcard/pcMedia/`.
 
 ### Disclosure
 
@@ -1774,8 +1899,9 @@ quietly:
   rather than tucked into a footnote.
 * **Nothing in this repository lowers the bar further.** The official firmware
   path is signature-checked in recovery with rollback protection (§10b);
-  `upgrade` is deliberately excluded from every tool and probe here, and
-  nothing here touches the bootloader, fastboot or maskrom. What is published
+  `upgrade`, and `transport` with type `"firmware"`, are deliberately excluded
+  from every tool and probe here, and nothing here touches the bootloader,
+  fastboot or maskrom. What is published
   is a description of a USB HID protocol and an observation about a default
   setting.
 

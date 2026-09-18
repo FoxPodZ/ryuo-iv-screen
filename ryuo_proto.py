@@ -63,8 +63,9 @@ BODY — this is HTTP. They reimplemented HTTP over USB HID.
     Header keys: SeqNumber, AckNumber, ContentLength, ContentType,
                  FileName, FileSize, ContentRange, Counter, Date, msgId
     The device ACKs with AckNumber = your SeqNumber + 1.
-    FileName/FileSize/ContentRange are used for chunked media upload
-    over this same envelope (MTP is not enabled on the gadget).
+    FileName/FileSize/ContentRange exist in DataHeader, but there is no
+    working upload over HID on this firmware -- see "media files" below.
+    Media goes on with adb. (MTP is not enabled.)
 --------------------------------------------------------------------------
 """
 
@@ -133,6 +134,16 @@ RES_FAN_LCD             = "fanLCD"
 RES_FAN_LCD_SET         = "fanLCDSet"
 RES_UPGRADE             = "upgrade"
 RES_DISCONN             = "disconn"       # host going away -> reverts to stock loop
+
+# Handled inside SerialService itself. conn, mediaDelete include and the
+# transport stub are confirmed on fw 1.0.10 (tests/probe.py conn_handshake,
+# media_delete, transport_stub); mediaDelete exclude and turboPump are read
+# from source. PROTOCOL.md §4.
+RES_CONN                = "conn"          # handshake -> capability descriptor + media listing
+RES_MEDIA_DELETE        = "mediaDelete"   # {"include": [...]} or {"exclude": [...]}
+RES_TRANSPORT           = "transport"     # upload stub: replies, receives nothing (see below)
+RES_TRANSPORTED         = "transported"   # no reply; type "firmware" pokes the updater
+RES_TURBO_PUMP          = "turboPump"     # writes an aio_cooler I2C driver this board doesn't have
 
 
 # ---------------------------------------------------------------- framing
@@ -217,6 +228,72 @@ def request(method: str, resource: str, payload: dict | None = None,
     content = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
     body = build_body(f"{method} {resource} 1", content, seq=seq)
     return pad_for_hid(encode(body))
+
+
+def reply_json(body: str | None):
+    """The JSON payload of a decoded reply, or None if there isn't one."""
+    if not body:
+        return None
+    content = body.partition("\r\n\r\n")[2].strip()
+    try:
+        return json.loads(content) if content else None
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- media files
+# There is NO upload over HID on this firmware, whatever the resource names
+# suggest. Confirmed on fw 1.0.10 unless marked:
+#
+#   transport    stores fileName / fileSize / type and replies
+#                {"state": "success", "blockMaxSize": 888888888} -- but no
+#                file is created and nothing ever receives data. A frame of
+#                raw file data goes to the command parser, which finds no
+#                headers and should throw (source only; never sent).
+#   transported  replies nothing. For type "firmware" it asks RKUpdateService
+#                to check for a local update package (source only).
+#
+# Get media onto the device with `adb push` to /sdcard/pcMedia/. What does
+# work over HID is listing (`conn`) and deleting (`mediaDelete`).
+
+def check_media_name(name: str) -> str:
+    """Refuse anything but a bare file name.
+
+    mediaDelete builds its path as "sdcard/pcMedia/" + name, so a name with a
+    separator in it would reach outside pcMedia/.
+    """
+    if not name or name in (".", "..") or "\x00" in name:
+        raise ValueError(f"bad media name {name!r}")
+    if "/" in name or "\\" in name:
+        raise ValueError(f"media name {name!r} has a path separator; "
+                         f"only bare names in pcMedia/ are accepted")
+    return name
+
+
+def media_delete_payload(*, include: list[str] | None = None,
+                         exclude: list[str] | None = None) -> dict:
+    """Body of `POST mediaDelete`. Only ever deletes from sdcard/pcMedia/.
+
+    include: delete exactly these.
+    exclude: delete everything in pcMedia/ EXCEPT these -- how Info Hub
+             syncs. An empty exclude list deletes all of it. The presets in
+             pcMediaPreset/ are untouched either way.
+    """
+    if (include is None) == (exclude is None):
+        raise ValueError("give exactly one of include= or exclude=")
+    names = include if include is not None else exclude
+    for n in names:
+        check_media_name(n)
+    return ({"include": list(include)} if include is not None
+            else {"exclude": list(exclude)})
+
+
+def redact_conn(info: dict) -> dict:
+    """A copy of a `conn` reply with the serial number blanked, for pasting."""
+    out = dict(info)
+    if "sn" in out:
+        out["sn"] = "<redacted>"
+    return out
 
 
 # ---------------------------------------------------------------- payloads

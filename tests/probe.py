@@ -20,8 +20,11 @@ separate runs of an eyeball-based version disagreed with each other while the
 kernel knew the answer the whole time.
 
 SAFETY
-  * `upgrade` is not in here and will not be added. It hands a zip to
-    RKUpdateService. Nothing about that belongs in a probe script.
+  * `upgrade` is not in here and will not be added. It starts an update in
+    RKUpdateService. Nothing about that belongs in a probe script. The same
+    goes for `transport` with type "firmware".
+  * The media probes only create and delete files named probe-*, and never
+    send raw file data: this firmware has no upload over HID.
   * Every probe re-pushes a known-good config afterwards, WITH media playing,
     so a bad value can't leave you judging the next probe against a black
     screen.
@@ -251,6 +254,16 @@ def _backlight_sysfs():
         except Exception as ex:
             return f"<{ex}>"
     return path, read
+
+
+def _adb_shell(cmd, timeout=8):
+    """stdout of an adb shell command, stripped; None if adb isn't usable."""
+    try:
+        r = subprocess.run(["adb", "shell", cmd],
+                           capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
 
 
 # ------------------------------------------------------------------- probes
@@ -730,6 +743,120 @@ def _wbsid(link):
     time.sleep(2.5)
     out["applied_flat"] = ask("any change with the unwrapped shape?")
     link.known_good()
+    return out
+
+
+@probe("conn_handshake", "§4", "POST conn: capability descriptor and media listing?")
+def _conn(link):
+    """Info Hub's first message, read from SerialService and never sent from
+    here. The reply should carry the attribute list, versions, the unit's
+    serial number and both media directories. The serial is recorded as
+    present/absent only -- results files get pasted into issues."""
+    out = {}
+    info = None
+    for label, payload in (("no payload", None), ("{}", {})):
+        print(f"  -> POST conn  ({label})")
+        reply = link.send(proto.POST, proto.RES_CONN, payload)
+        out[f"reply ({label})"] = (reply or "(no reply)").splitlines()[0]
+        info = proto.reply_json(reply)
+        if isinstance(info, dict):
+            break
+    if not isinstance(info, dict):
+        out["descriptor"] = "none"
+        return out
+    print(json.dumps(proto.redact_conn(info), indent=2)[:3000])
+
+    media = info.get("media") or {}
+    attrs = info.get("attribute") or []
+    out["keys"] = sorted(info)
+    out["attribute"] = attrs
+    out["turbo_pump_advertised"] = "Turbo Pump" in attrs
+    out["OS"] = info.get("OS")
+    out["productId"] = info.get("productId")
+    out["version"] = info.get("version")
+    out["serial_present"] = "sn" in info
+    out["media_preset"] = media.get("preset")
+    out["media_custom"] = media.get("custom")
+
+    listing = _adb_shell("ls /sdcard/pcMedia/")
+    if listing is not None:
+        on_disk = sorted(listing.split())
+        out["custom_matches_adb_ls"] = (sorted(media.get("custom") or []) == on_disk
+                                        or f"no -- adb ls: {on_disk}")
+    out["screen_changed"] = ask("did anything change on screen after conn?",
+                                ("n", "y"))
+    return out
+
+
+@probe("transport_stub", "§4", "Is `transport` a stub that never receives a file?")
+def _transport_stub(link):
+    """Read from the decompile: `transport` stores a name and size and replies
+    {"state": "success", "blockMaxSize": 888888888}, but opens no file and
+    routes no data anywhere, and `transported` sends no reply at all.
+
+    This sends just those two requests. No file frames go in between: the
+    decompile says a frame of raw data reaches the command parser, which
+    should throw. The keepalive keeps running throughout, which is itself
+    part of the test -- if transport put the device into a receive mode,
+    the widgets would stop updating."""
+    name = "probe-transport.txt"
+    path = f"/sdcard/pcMedia/{name}"
+    out = {}
+    print(f"  -> POST transport  {{fileName: {name!r}, fileSize: 16, type: 'media'}}")
+    reply = link.send(proto.POST, proto.RES_TRANSPORT,
+                      {"fileName": name, "fileSize": 16, "type": "media"})
+    out["transport_reply"] = (proto.reply_json(reply)
+                              or (reply or "(no reply)").splitlines()[0])
+    time.sleep(2)
+    out["widgets_still_updating"] = ask("are the widget values still moving?")
+
+    print(f"  -> POST transported  {{fileName: {name!r}, md5: ''}}  "
+          f"(expect no reply)")
+    reply = link.send(proto.POST, proto.RES_TRANSPORTED,
+                      {"fileName": name, "md5": ""}, timeout=3)
+    out["transported_reply"] = (reply or "(no reply)").splitlines()[0]
+
+    if _adb_shell("echo ok") == "ok":
+        out["file_created"] = _adb_shell(f"[ -e {path} ] && echo yes || echo no")
+    else:
+        out["file_created"] = "(no adb, not checked)"
+    return out
+
+
+@probe("media_delete", "§4", "Does mediaDelete include remove exactly what it names?")
+def _media_delete(link):
+    """Creates three small files in pcMedia/ over adb, deletes one with
+    `include` and checks the other two survive, then cleans up.
+
+    `exclude` is not tried: it deletes everything in pcMedia/ that isn't
+    listed, which on a real unit means your own media. Needs adb."""
+    if _adb_shell("echo ok") != "ok":
+        return {"skipped": "needs adb to create and check the test files"}
+    names = ["probe-del-a.txt", "probe-del-b.txt", "probe-del-c.txt"]
+    for n in names:
+        _adb_shell(f"echo probe > /sdcard/pcMedia/{n}")
+
+    def present():
+        listing = (_adb_shell("ls -1 /sdcard/pcMedia/") or "").splitlines()
+        return [n for n in names if n in listing]
+
+    out = {"created": present()}
+    info = proto.reply_json(link.send(proto.POST, proto.RES_CONN, None))
+    custom = ((info or {}).get("media") or {}).get("custom") or []
+    out["conn_lists_them"] = (all(n in custom for n in names) if info
+                              else "(no conn reply)")
+
+    print(f"  -> POST mediaDelete  {{'include': [{names[0]!r}]}}")
+    reply = link.send(proto.POST, proto.RES_MEDIA_DELETE,
+                      proto.media_delete_payload(include=names[:1]))
+    out["include_reply"] = (reply or "(no reply)").splitlines()[0]
+    time.sleep(0.5)
+    out["left_after_include"] = present()          # expect b and c
+
+    link.send(proto.POST, proto.RES_MEDIA_DELETE,
+              proto.media_delete_payload(include=names[1:]))
+    time.sleep(0.5)
+    out["left_after_cleanup"] = present()          # expect none
     return out
 
 

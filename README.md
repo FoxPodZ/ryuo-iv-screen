@@ -61,6 +61,10 @@ The findings that took the longest to establish, each written up in full:
 * **Six API fields are dead code**, four readouts render fine but have no tile
   in ASUS's picker, and two of ASUS's own widgets are visibly buggy.
   [§4](PROTOCOL.md#4-resources), [§10](PROTOCOL.md#10-post-all--telemetry)
+* **The HID upload is a stub.** `transport` answers
+  `{"state": "success", "blockMaxSize": 888888888}` and nothing ever receives
+  the file, so media goes on over adb. Listing and deleting media do work over
+  HID. [§4](PROTOCOL.md#4-resources)
 * **The USB vendor id changes between firmware versions** while the product id
   stays put, so tools that match on the vendor id stop finding the cooler after
   an update. [§1](PROTOCOL.md#1-transport)
@@ -88,7 +92,10 @@ Everything below is documented in PROTOCOL.md and driven by the scripts here:
 | `rotate`, `waterfallMode`, `badges`, `align`, `position`, `color` | 💀 dead code — parsed, never used |
 | Fan LCD | ⚠️ ACK, no observed effect |
 | Animated overlay filter | ✅ — any non-empty `filter.value` turns it on; you can't pick which effect |
-| Media *upload* over the HID envelope | ⚠️ framing understood, not implemented — just `adb push` instead |
+| Media listing (`conn`) | ✅ `ryuo_ctl.py ls` — presets and your files, no adb needed |
+| Media delete (`mediaDelete`) | ✅ `ryuo_ctl.py rm`; the delete-everything-else mode is read from source |
+| Media *upload* over HID | 💀 doesn't exist — `transport` replies "success" and never receives a byte. Use `adb push` |
+| Pump control (`turboPump`) | 💀 targets a pump driver this board doesn't have |
 | AMD GPU telemetry | ⚠️ only NVIDIA (`nvidia-smi`) is wired up so far |
 | CPU temperature & fan speeds on Windows | ⚠️ Linux only — deliberately; see *Known limits* below |
 
@@ -346,7 +353,16 @@ python ryuo_ctl.py get spec
 python ryuo_ctl.py brightness 30       # 0-102; 100 is only ~98% of max
 python ryuo_ctl.py items "CPU Temperature" "CPU Load" "Date&Time"
 python ryuo_ctl.py raw POST temperature '{"value":"Fahrenheit"}'
+
+python ryuo_ctl.py info                # firmware, hardware rev, capabilities (serial blanked)
+python ryuo_ctl.py ls                  # what's in pcMediaPreset/ and pcMedia/
+python ryuo_ctl.py rm old_clip.mp4     # delete from pcMedia/
+python ryuo_ctl.py rm --except a.mp4 b.png   # delete everything in pcMedia/ but these
 ```
+
+`rm` only ever touches `/sdcard/pcMedia/`, and refuses names with a path
+separator. `rm --except` is read from source and hasn't been run on hardware.
+It deletes every file you didn't name, so run `ls` first.
 
 ---
 
@@ -373,7 +389,13 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
 * **You cannot install apps on the cooler.** Don't waste the 3h+ like I did. The bundled PackageInstaller ships *only* `.UninstallActivity`. `pm install` verifies, stages and commits the session fine, then hangs forever waiting on a confirmation callback whose activity doesn't exist — and never returns an error. So no custom launcher, no third-party APKs, no on-device anything.
 * **No useful on-device sensors.** hwmon on the board exposes `soc_thermal` plus factory test stubs (`test_ac`, `test_battery`, `test_usb`). There's no pump, fan or coolant sensor readable locally. All cooler telemetry has to come from the host.
 * **The screen is host-bound by design.** It powers down with the PC and reverts to the stock loop ~10 s after the host stops talking. Nothing in the protocol changes that.
-* **Media upload isn't implemented here.** The envelope supports it (`FileName` / `FileSize` / `ContentRange` headers, chunked over the same frames — MTP is not enabled on the gadget), but `adb push` is easier and works today.
+* **There is no upload over HID.** The protocol has `transport` / `transported`
+  resources and the header schema has `FileName` / `FileSize` / `ContentRange`,
+  but on this firmware nothing receives the data: `transport` replies "success"
+  and that's all it does. MTP isn't enabled either, so `adb push` is the only
+  way media gets on. Listing and deleting do work over HID (`ryuo_ctl.py ls`,
+  `rm`). An earlier version of this README said the envelope supported
+  uploads; it doesn't. See PROTOCOL.md §4.
 * **Brightness saturates at 102, not 100.** The API value is multiplied by ≈2.5
   and handed to the kernel, which clamps at 255 — so `100` lands on 250, about
   98% of maximum, and true full brightness needs `102`. Info Hub never sends

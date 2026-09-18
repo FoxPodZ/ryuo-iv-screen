@@ -65,6 +65,13 @@ def test_stuffing_removes_delimiters_from_interior():
     assert proto.START not in frame[1:-1], "raw 0x5A leaked into the payload"
 
 
+def test_stuffing_exact_bytes():
+    """0x5A becomes 5B 01 -- and that new 5B must not be escaped again."""
+    assert proto._stuff(b"\x5a") == b"\x5b\x01"
+    assert proto._stuff(b"\x5b") == b"\x5b\x02"
+    assert proto._stuff(b"\x5a\x5b\x5a") == b"\x5b\x01\x5b\x02\x5b\x01"
+
+
 def test_checksum_is_additive_sum_not_crc():
     body = b"hello"
     inner = (len(body) + 5).to_bytes(2, "big") + body
@@ -221,6 +228,50 @@ def test_fan_item_label_slicing():
         assert item.startswith("Fan Speed")
         assert len(item) > 10, "label slice needs length > 10 to render"
         assert item[10:] == name
+
+
+# ----------------------------------------------------------------- media files
+
+@pytest.mark.parametrize("name", [
+    "", ".", "..", "a/b.mp4", "..\\b.mp4", "../pcMediaPreset/RYUO_x.mp4",
+    "a\x00b",
+])
+def test_bad_media_names_refused(name):
+    """mediaDelete joins "sdcard/pcMedia/" + name, so a separator escapes it."""
+    with pytest.raises(ValueError):
+        proto.check_media_name(name)
+    with pytest.raises(ValueError):
+        proto.media_delete_payload(include=[name])
+
+
+@pytest.mark.parametrize("name", ["my clip (2).mp4", "RYUO_mine.mp4", "ryuo.png"])
+def test_good_media_names_pass(name):
+    """RYUO* only matters to the player's lookup, not to mediaDelete."""
+    assert proto.check_media_name(name) == name
+
+
+def test_media_delete_takes_exactly_one_mode():
+    assert proto.media_delete_payload(include=["a.mp4"]) == {"include": ["a.mp4"]}
+    assert proto.media_delete_payload(exclude=["k.mp4"]) == {"exclude": ["k.mp4"]}
+    with pytest.raises(ValueError):
+        proto.media_delete_payload()
+    with pytest.raises(ValueError):
+        proto.media_delete_payload(include=["a"], exclude=["b"])
+
+
+def test_redact_conn_hides_serial_only():
+    info = {"sn": "TC0000", "OS": "Android", "productId": "cm16"}
+    out = proto.redact_conn(info)
+    assert out["sn"] != "TC0000" and out["productId"] == "cm16"
+    assert info["sn"] == "TC0000", "must not modify the caller's dict"
+
+
+def test_reply_json():
+    body = "1 200\r\nAckNumber=2\r\n\r\n{\"state\":\"success\"}"
+    assert proto.reply_json(body) == {"state": "success"}
+    assert proto.reply_json("1 200\r\n\r\n") is None
+    assert proto.reply_json(None) is None
+    assert proto.reply_json("1 200\r\n\r\nnot json") is None
 
 
 def test_device_identity():
