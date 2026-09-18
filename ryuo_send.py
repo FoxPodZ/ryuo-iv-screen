@@ -354,9 +354,6 @@ def main() -> None:
             print(f'note: --readout {label} has no matching item, so it will '
                   f'not be drawn. Add --items "{proto.fan_item(label)}".')
 
-    h = open_device(args.vid, args.pid, args.index)
-    seq = 1
-
     cfg = proto.config_payload(
         unit=args.unit,
         brightness=args.brightness,
@@ -377,6 +374,17 @@ def main() -> None:
             time_zone=args.timezone,
         ),
     )
+    # The whole config has to fit in one 1024-byte report or the device
+    # ignores it without a word. Check before touching the device.
+    try:
+        proto.request(proto.POST, proto.RES_CONFIG, cfg, seq=1)
+    except ValueError as ex:
+        sys.exit(f"{ex}.\nThe config carries the playlist, widget slots, CPU/GPU "
+                 f"names and time zone; shorten the playlist or the file names.")
+
+    h = open_device(args.vid, args.pid, args.index)
+    seq = 1
+
     ap_settle = 1.6   # case 14 does postDelayed(doBlockScreen, 1000L)
     txn(h, proto.POST, proto.RES_CONFIG, cfg, seq, verbose=True)
     print(f"config pushed: slots={proto.sysinfo_slots(*args.items)} "

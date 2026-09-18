@@ -21,7 +21,9 @@ The screen's USB gadget runs `sys.usb.config=hid,adb`. Device side opens `/dev/h
 
 Report ID `0x00` and `0x01` both work — prepend one byte before the write, hidapi expects it.
 
-Reports are **1024 bytes**. Frames are zero-padded up to a multiple of that before writing, and long frames are simply written as consecutive 1024-byte chunks.
+Reports are **1024 bytes**, and **every frame has to fit in one**: the device
+drops a frame that spills into a second report, silently (§2). Frames are
+zero-padded out to 1024 before writing.
 
 ---
 
@@ -113,6 +115,24 @@ If the theory holds, the handle shows `(deleted)` after the rebuild, and
 requests get no reply until `BY_PC_ON` is sent. Several `hidg0` lines after a
 few Info Hub connects would mean each `BY_PC_ON` leaks a handle.
 
+### Pace: about 11 frames a second in, fewer replies out
+
+Measured on firmware 1.0.10 from a Windows host, by writing 30 `GET spec`
+requests back to back:
+
+* **Writes went through at about 11 a second** — 30 in 2.75 s. A faster
+  writer simply blocks. Per the source, the device reads one report and then
+  sleeps 50 ms before the next read.
+* **Replies came back at about 8.5 a second**: all 30, in order, the last one
+  1.1 s after the last write. Per the source, replies leave through a queue
+  that sends one message per 100 ms tick and has no size limit.
+
+So a host sustaining more than roughly 8 requests a second builds a backlog of
+replies that keeps growing, and a client that treats "the next reply" as the
+answer to "the request just sent" will read stale ones. Match replies on
+`AckNumber`. `ryuo_send.py --rgb` at its default 10 pushes a second, plus
+telemetry, sits above that line.
+
 
 ## 2. Frame format
 
@@ -155,6 +175,35 @@ Byte-stuffing applies to `LEN | BODY | CKSUM` only, never to the delimiters:
 
 ...then padded with `0x00` out to 1024 bytes.
 
+### A frame must fit in one report
+
+The device parses every 1024-byte report on its own. It strips the trailing
+zeros, and what's left has to start **and** end with `0x5A`; otherwise it's
+logged as "possibly split into two, not handled" and discarded. A frame that
+spills into a second report therefore vanishes — no reply, no effect, no
+error. Tested on firmware 1.0.10 with `GET spec`, which always replies when it
+parses:
+
+| Frame size | Reports | Reply |
+| --- | --- | --- |
+| 681, 982, 1020, 1023, 1024 bytes | 1 | ✅ |
+| 1025, 1026, 1042, 1083, 1183, 1583, 3083 bytes | 2–4 | none |
+
+In practice `config` is the frame that runs into this. It carries the playlist,
+the six widget slots, the CPU and GPU names and the time zone. Ordinary setups
+come to 600–950 bytes, and a playlist of about a dozen long file names goes
+over. `ryuo_proto.request()` refuses to build a frame over 1024 bytes, and
+`ryuo_send.py` says so before it touches the device.
+
+The limit only applies in one direction. The device's own replies can span
+several reports and arrive intact: a `conn` reply listing 32 files came back
+as a 1227-byte frame over two reports. So a client still has to reassemble
+what it reads (§12, step 4).
+
+The same check lets two frames share one report — exactly four `0x5A` bytes
+are split into two frames. *Read from source, not tried.* Three or more in one
+report aren't handled.
+
 ---
 
 ## 3. Body: HTTP over USB HID
@@ -189,7 +238,7 @@ Header keys (`DataHeader` fields — any field set to `-1` is omitted rather tha
 | --- | --- |
 | `SeqNumber` | your sequence number |
 | `AckNumber` | device echoes `SeqNumber + 1` |
-| `ContentLength` | byte length of the payload |
+| `ContentLength` | byte length of the payload. The device never reads it, and in its own replies it's a character count (below) |
 | `ContentType` | always `json` in practice |
 | `FileName`, `FileSize`, `ContentRange` | in the schema, never read. There is no upload over HID — see `transport` in §4 |
 | `Counter`, `Date`, `msgId` | seen in the schema, unused by the paths documented here |
@@ -198,6 +247,19 @@ Payload is JSON, `ContentLength` bytes of it.
 
 Of all these, `SerialService` reads exactly one from an incoming request:
 `SeqNumber`, to build the `AckNumber` of its reply. *Read from source.*
+
+Two more things about the parser, also read from source:
+
+* **A request needs all three start-line parts and at least two header
+  lines.** With fewer than three parts in `<METHOD> <resource> 1`, the method
+  is left unset; with fewer than two header lines, the header object is null.
+  The handler dereferences both, which should crash `SerialService`.
+  `ryuo_proto` always sends `ContentType` and `ContentLength`. Not tried, on
+  purpose.
+* **In replies, `ContentLength` counts characters, not bytes** — it's a Java
+  string length. The two differ as soon as the payload holds non-ASCII text,
+  such as a `conn` listing with an accented file name. Split a reply at the
+  blank line instead of trusting it.
 
 > **Retracted.** Earlier versions of this document said media upload runs over
 > this envelope using the `FileName` / `FileSize` / `ContentRange` headers.
@@ -238,7 +300,7 @@ It still forwards every one except `conn` to HomeUI, which ignores them:
 | `conn` | none — replies with capabilities, versions, serial number and both media listings (see below) | ✅ tested on device (fw 1.0.10) |
 | `mediaDelete` | `{"include": [names]}` deletes those from `pcMedia/`; `{"exclude": [names]}` deletes everything else there | ✅ `include` tested on device; 📖 `exclude` read from source |
 | `transport` | `{"fileName", "fileSize", "type"}` — replies `success` and receives nothing. **There is no upload over HID** | 💀 **stub, confirmed on device** |
-| `transported` | `{"fileName", "md5"}` — no reply. With `type` `"firmware"` it starts `RKUpdateService`'s local update check | 💀 for media; ☠️ for `"firmware"` |
+| `transported` | `{"fileName", "md5"}` — no reply for media. With `type` `"firmware"` it starts `RKUpdateService`'s local update check and replies once that check reports back | 💀 for media; ☠️ for `"firmware"` |
 | `turboPump` | `{"enable": bool, "value": int}` — writes to a pump driver this board doesn't have | 💀 **no driver on this board** (checked over adb) |
 
 > ⚠️ **`1 200` does not mean "accepted".** This device replies `1 200` to every
@@ -247,7 +309,7 @@ It still forwards every one except `conn` to HomeUI, which ignores them:
 > `{"rotate": 90}` and `{"value": "90"}` alike and does nothing for any of them.
 > The status confirms the *framing* parsed. Nothing more. Only the panel tells
 > you whether something worked. (The one exception found so far runs the other
-> way: `transported` doesn't reply at all.)
+> way: `transported` for anything but firmware doesn't reply at all.)
 
 **Five markers, and they mean different things.**
 
@@ -585,12 +647,14 @@ The names, the `fileName` / `fileSize` fields and a reply advertising a
   fields. It creates no file, and the device never switches into receiving
   data: the widgets kept updating afterwards, and no file appeared in
   `pcMedia/`.
-* **`transported`** `{"fileName": str, "md5": str}` sends **no reply** — the
-  only resource found so far that doesn't answer. The md5 is read and
+* **`transported`** `{"fileName": str, "md5": str}` sends **no reply** for
+  media — the only resource found so far that stays silent. The md5 is read and
   discarded. If the name matches the last `transport` and its `type` was
   `"firmware"`, it starts `RKUpdateService`'s check for a local update
-  package — the same signature-checked path as `upgrade` (§11). Nothing in
-  this repository sends that type.
+  package — the same signature-checked path as `upgrade` (§11) — and the
+  reply comes later, once that check reports back: `200 {"state":"success"}`
+  or `400 {"state":"failure"}`, acknowledging the `transported` request
+  (read from source). Nothing in this repository sends that type.
 * **Don't follow `transport` with raw file data.** A data frame goes to the
   ordinary command parser, which expects header lines; per the source it
   throws on a frame without them. Not tried, on purpose.
@@ -1830,6 +1894,23 @@ Things that are true about the board but aren't part of the protocol:
 * **You cannot install APKs.** The bundled PackageInstaller ships *only* `.UninstallActivity`. `pm install` verifies, stages and commits the session fine, then hangs forever waiting on a confirmation callback whose activity doesn't exist. No timeout, no error. Custom launchers and third-party apps are simply off the table.
 * **hwmon has nothing useful**: `soc_thermal` plus factory test stubs (`test_ac`, `test_battery`, `test_usb`). No pump, fan or coolant sensor readable on-device — that's why all cooler telemetry has to come from the host. `SerialService` does carry a `turboPump` handler for an `aio_cooler` I²C pump driver (§4), but that driver isn't on this board either.
 * The factory app (`com.baiyi.app.factorymode`) is Chinese-only, which is a nice confirmation of the Baiyi ODM origin.
+* **The cooler keeps a log of everything the host sends it.** Both apps
+  append their debug output to files on the device's own storage:
+
+  ```
+  /sdcard/catchlog/log/hidserver_log.txt   SerialService: every frame, raw and decoded
+  /sdcard/catchlog/log/home_log.txt        HomeUI
+  ```
+
+  On the test unit (firmware 1.0.10) the first file was 41 MB and held 3,730
+  logged `POST` requests with their JSON and 3,929 raw frames in hex. Per the source it's deleted
+  and started over once it passes 50 MB, and it grows even when idle: the
+  send loop writes a few lines every 100 ms. Two consequences:
+  * **It's a free traffic log.** `adb pull /sdcard/catchlog/log/` shows what a
+    host actually sent, Info Hub included, without running logcat.
+  * **What you send is kept on the cooler.** CPU and GPU names, readout
+    labels, playlists, the time zone — and, in `conn` replies, the unit's
+    serial number — sit in that file until it rolls over or is deleted.
 * **The `upgrade` resource starts an update in `RKUpdateService`**, which
   verifies the package against the bundled `otacert` in recovery. The package
   itself never travels over HID. That is the official
@@ -1917,9 +1998,13 @@ is on foxpodz.de and this section will be updated.
 The whole protocol is in `ryuo_proto.py` — framing, checksum, stuffing, and every payload builder — with no I/O in it. Roughly:
 
 1. Open the hidraw node for product id `1C76` (any vendor id) interface 0.
-2. Build a frame: JSON payload → HTTP-ish body → `encode()` → pad to 1024.
-3. Write it in 1024-byte chunks with a report-ID byte in front.
+2. Build a frame: JSON payload → HTTP-ish body → `encode()`. It has to come
+   to **1024 bytes or less** — anything longer is dropped without a reply
+   (§2). Pad it to exactly 1024.
+3. Write it as one 1024-byte report with a report-ID byte in front.
 4. Read 1024-byte reports until you've seen two `0x5A`s, slice between them, unstuff, verify the checksum.
+   Replies can lag behind under load; match them to requests by `AckNumber`,
+   and keep the sustained rate under about 8 requests a second (§1).
 5. Send `POST config` once. Wait ~1.6 s.
 6. Loop `POST all` every second, forever, or the screen goes back to stock.
    **Run this on a background thread, not between commands** — if your code

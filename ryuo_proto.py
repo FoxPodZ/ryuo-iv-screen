@@ -49,7 +49,9 @@ FRAME
     stuffing (payload only, never the delimiters):
         0x5A -> 5B 01
         0x5B -> 5B 02
-    Whole frame is then zero-padded to a multiple of 1024 before the HID write.
+    The whole frame must fit in ONE 1024-byte report, zero-padded to 1024.
+    The device parses each report on its own, so a frame that spills into a
+    second report is dropped without a reply (tested on fw 1.0.10).
 
 BODY — this is HTTP. They reimplemented HTTP over USB HID.
 
@@ -225,9 +227,21 @@ def pad_for_hid(frame: bytes, size: int = REPORT_SIZE) -> bytes:
 
 def request(method: str, resource: str, payload: dict | None = None,
             *, seq: int | None = None) -> bytes:
+    """One ready-to-write 1024-byte report.
+
+    Raises ValueError if the frame doesn't fit in one report. The device reads
+    each report on its own and silently drops a frame that doesn't start and
+    end inside it -- no reply, no effect -- so sending one is never useful.
+    A long playlist is the usual way to get there (PROTOCOL.md §2).
+    """
     content = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
     body = build_body(f"{method} {resource} 1", content, seq=seq)
-    return pad_for_hid(encode(body))
+    frame = encode(body)
+    if len(frame) > REPORT_SIZE:
+        raise ValueError(f"{method} {resource} would be a {len(frame)}-byte frame; "
+                         f"the device drops anything over one {REPORT_SIZE}-byte "
+                         f"report")
+    return pad_for_hid(frame)
 
 
 def reply_json(body: str | None):

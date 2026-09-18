@@ -113,6 +113,30 @@ def test_padding_is_multiple_of_report_size():
         assert len(padded) % proto.REPORT_SIZE == 0
 
 
+def _payload_for_frame_size(total):
+    """A GET spec payload whose frame is exactly `total` bytes."""
+    for n in range(3000):
+        payload = {"pad": "x" * n}
+        body = proto.build_body("GET spec 1", '{"pad":"' + "x" * n + '"}', seq=1)
+        if len(proto.encode(body)) == total:
+            return payload
+    raise AssertionError(f"no padding makes a {total}-byte frame")
+
+
+@pytest.mark.parametrize("total", [1020, 1024])
+def test_request_up_to_one_report_is_built(total):
+    """fw 1.0.10 answered 1020- and 1024-byte frames (PROTOCOL.md §2)."""
+    frame = proto.request(proto.GET, "spec", _payload_for_frame_size(total), seq=1)
+    assert len(frame) == proto.REPORT_SIZE
+
+
+@pytest.mark.parametrize("total", [1025, 1583])
+def test_request_over_one_report_is_refused(total):
+    """...and dropped 1025 bytes and up without a reply, so don't build them."""
+    with pytest.raises(ValueError, match="1024-byte report"):
+        proto.request(proto.GET, "spec", _payload_for_frame_size(total), seq=1)
+
+
 # -------------------------------------------------------------------- payloads
 
 def test_content_length_is_a_byte_count():

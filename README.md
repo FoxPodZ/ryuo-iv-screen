@@ -46,8 +46,9 @@ The findings that took the longest to establish, each written up in full:
   [disclosure note](PROTOCOL.md#disclosure) for why it is stated openly.
 * **The wire format is HTTP-shaped text inside 1024-byte HID reports**, framed
   with `0x5A` delimiters, byte stuffing and an additive checksum that is not a
-  CRC despite being built by a function called `getCRC()`.
-  [§2](PROTOCOL.md#2-frame-format)
+  CRC despite being built by a function called `getCRC()`. A frame that doesn't
+  fit in a single report is dropped without a word — which is where long
+  playlists go to die. [§2](PROTOCOL.md#2-frame-format)
 * **The session is a dead-man's switch.** Stop sending telemetry for ~10 seconds
   and the screen reverts to stock — which makes a working client look broken the
   moment you stop to read something. [§10](PROTOCOL.md#10-post-all--telemetry)
@@ -324,6 +325,11 @@ python ryuo_send.py --media a.mp4 b.mp4 --shuffle          # == --play-mode Rand
 
 Extension decides the player: `.mp4` → VideoView (advances at end of clip), `.gif` → Fresco one-shot (advances at end of gif), anything else → Glide still image (advances after a hardcoded 7 s). Missing files are silently skipped. Mixing all three in one playlist is fine.
 
+Playlists have a size limit: the whole config, playlist included, has to fit in
+one 1024-byte frame, which works out to roughly a dozen long file names. Past
+that the device ignores the config without an error, so `ryuo_send.py` checks
+the size first and refuses instead. Shorter file names buy room.
+
 > **Gotcha:** `playMode` accepts exactly `Single`, `Random`, `Cycle` — case-sensitive. Any other string passes the first check in the app and then falls through the second one with a bare `return`, leaving the player with no video path. You get a black screen and zero errors. See [PROTOCOL.md](PROTOCOL.md#7-the-playmode-trap).
 
 ### Split screen
@@ -396,6 +402,19 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
   way media gets on. Listing and deleting do work over HID (`ryuo_ctl.py ls`,
   `rm`). An earlier version of this README said the envelope supported
   uploads; it doesn't. See PROTOCOL.md §4.
+* **Every frame has to fit in one 1024-byte report.** The device reads each
+  report on its own and drops a frame that spills into a second one — no
+  reply, no effect. Tested on firmware 1.0.10: 1,024 bytes gets an answer,
+  1,025 doesn't. `ryuo_proto.request()` refuses to build a longer frame. In
+  practice only `config` gets near the limit, through a long playlist.
+* **Keep it under about 8 requests a second.** The device takes in roughly 11
+  reports a second and sends at most about 10 replies, so a faster host builds
+  a reply backlog that keeps growing. See PROTOCOL.md §1.
+* **The cooler logs everything you send it** to
+  `/sdcard/catchlog/log/hidserver_log.txt` — CPU/GPU names, readout labels,
+  playlists, and the serial number in `conn` replies — up to 50 MB before it
+  starts over. Handy for debugging (`adb pull` it), worth knowing for privacy.
+  See PROTOCOL.md §11.
 * **Brightness saturates at 102, not 100.** The API value is multiplied by ≈2.5
   and handed to the kernel, which clamps at 255 — so `100` lands on 250, about
   98% of maximum, and true full brightness needs `102`. Info Hub never sends
