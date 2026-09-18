@@ -201,8 +201,9 @@ as a 1227-byte frame over two reports. So a client still has to reassemble
 what it reads (§12, step 4).
 
 The same check lets two frames share one report — exactly four `0x5A` bytes
-are split into two frames. *Read from source, not tried.* Three or more in one
-report aren't handled.
+are split into two frames. Confirmed on firmware 1.0.10: two `GET spec` frames
+in one report got two replies; three in one report got none. So pack at most
+two per report, or one each.
 
 ---
 
@@ -248,18 +249,47 @@ Payload is JSON, `ContentLength` bytes of it.
 Of all these, `SerialService` reads exactly one from an incoming request:
 `SeqNumber`, to build the `AckNumber` of its reply. *Read from source.*
 
-Two more things about the parser, also read from source:
+Two more things about the parser, found in the source and then confirmed on
+hardware:
 
 * **A request needs all three start-line parts and at least two header
-  lines.** With fewer than three parts in `<METHOD> <resource> 1`, the method
-  is left unset; with fewer than two header lines, the header object is null.
-  The handler dereferences both, which should crash `SerialService`.
-  `ryuo_proto` always sends `ContentType` and `ContentLength`. Not tried, on
-  purpose.
+  lines, or it takes the whole device down.** With fewer than three parts in
+  `<METHOD> <resource> 1` the method is left unset; with fewer than two header
+  lines the header object is null. The handler dereferences both. Tested on
+  firmware 1.0.10: a two-part start line (`GET spec` with no trailing `1`)
+  **killed the `SerialService` process and dropped the USB gadget off the bus**
+  — the cooler vanished from both HID and adb. It came back only after an
+  `adb kill-server && adb start-server`, at which point Android had restarted
+  the service. So this isn't a caught error; it's a one-frame denial of
+  service against the screen. `ryuo_proto` always sends the full start line
+  plus `ContentType` and `ContentLength`, so it can't produce one — but a
+  hand-built client can, and a stray write during development did exactly this.
+
+  **And on one occasion the same crash took the kernel down with it.** Usually
+  the process just dies and the gadget re-initialises, as above. Once, it
+  escalated to a full kernel panic and reboot — the device's own boot history
+  recorded it (`kernel_panic,bug`, between the ordinary `reboot,shell`
+  entries), and `pstore` preserved the backtrace across the reboot:
+
+  ```
+  kernel BUG at lib/list_debug.c:61!
+  pc : __list_del_entry_valid+0xb8/0xcc
+  Call trace:  __list_del_entry_valid  task_work_run  work_pending
+  ```
+
+  `task_work_run` is the path the kernel takes as a process exits, to run the
+  deferred `fput()` that closes its file descriptors — so when SerialService
+  dies with `/dev/hidg0` open, the HID gadget driver's cleanup does a `list_del`
+  on a corrupted list and panics. That makes it a **use-after-free race in the
+  kernel gadget teardown, not a deterministic outcome**, which is why the
+  reboot is rare and won't reproduce on demand while the userspace crash above
+  is reliable. A malformed HID frame from the host can, some fraction of the
+  time, panic the device's kernel. See the [disclosure note](#disclosure).
 * **In replies, `ContentLength` counts characters, not bytes** — it's a Java
-  string length. The two differ as soon as the payload holds non-ASCII text,
-  such as a `conn` listing with an accented file name. Split a reply at the
-  blank line instead of trusting it.
+  string length. Confirmed on firmware 1.0.10: a `conn` reply whose payload was
+  1176 UTF-8 bytes, with a file name containing `ü` and `é`, reported
+  `ContentLength=1174` (1174 characters). Split a reply at the blank line
+  instead of trusting the count.
 
 > **Retracted.** Earlier versions of this document said media upload runs over
 > this envelope using the `FileName` / `FileSize` / `ContentRange` headers.
@@ -652,12 +682,19 @@ The names, the `fileName` / `fileSize` fields and a reply advertising a
   discarded. If the name matches the last `transport` and its `type` was
   `"firmware"`, it starts `RKUpdateService`'s check for a local update
   package — the same signature-checked path as `upgrade` (§11) — and the
-  reply comes later, once that check reports back: `200 {"state":"success"}`
-  or `400 {"state":"failure"}`, acknowledging the `transported` request
-  (read from source). Nothing in this repository sends that type.
-* **Don't follow `transport` with raw file data.** A data frame goes to the
-  ordinary command parser, which expects header lines; per the source it
-  throws on a frame without them. Not tried, on purpose.
+  reply comes later, once that check reports back. The reply half was tested
+  in isolation on firmware 1.0.10 by faking the updater's
+  `com.baiyi.action.systemupdate.check.result` broadcast (which only
+  `SerialService` listens to): result 1 gives `1 200 {"state":"success"}`,
+  result 0 gives `1 400 {"state":"failure"}`. The `AckNumber` is
+  `otaFileSeqNum + 1`, i.e. the seq of the `transported` that armed it.
+  Nothing in this repository sends that type.
+* **Don't follow `transport` with raw file data.** Nothing receives it: the
+  data frame goes to the ordinary command parser, which expects a start line
+  and headers. A frame without them crashes `SerialService` and drops the USB
+  gadget — that's the malformed-request failure from §3, confirmed on
+  hardware. Not tried as a `transport` follow-up specifically, but the parser
+  path is the same.
 
 So there's no way to put media on the device over HID. `adb push` to
 `/sdcard/pcMedia/` (§7) is the way; `conn` and `mediaDelete` above cover
@@ -1985,6 +2022,18 @@ quietly:
   fastboot or maskrom. What is published
   is a description of a USB HID protocol and an observation about a default
   setting.
+
+There is one genuine bug in that description: a malformed HID frame — a request
+missing part of its start line or its headers — can panic the device's kernel
+and reboot it (§3). It reaches a `list_del` on a corrupted list in the USB
+gadget teardown when `SerialService` dies with `/dev/hidg0` open. It is a
+host-to-device denial of service over the normal data interface, no root or adb
+needed to send it, and observed to reboot the unit once out of many crashes. In
+context it is minor: it needs the same USB access as everything else here, it is
+a reboot rather than a persistent effect, and the host already has a root shell
+two interfaces over. It is stated plainly for the same reason as the rest — it
+is a concrete, checkable fact about how the device behaves — and `ryuo_proto`
+cannot emit such a frame.
 
 As of publication this has not been raised with ASUS through a vulnerability
 process, because — for the reasons above — it doesn't read as one. If ASUS or
