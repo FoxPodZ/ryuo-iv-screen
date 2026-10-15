@@ -350,7 +350,9 @@ Passing `--media2` flips `screenMode` to `Screen Splitting`, at which point `med
 
 On its own it changes nothing durably — there's no keepalive, so the screen
 reverts ~10 s later. To change a *live* session, run it alongside
-`ryuo_send.py`; both can hold the hidraw node at once.
+`ryuo_send.py`; both can hold the hidraw node at once. Each one then also
+receives the other's replies, and skips them by `AckNumber` — `ryuo_ctl.py`
+says how many it skipped.
 
 ```bash
 python ryuo_ctl.py get config
@@ -377,11 +379,13 @@ It deletes every file you didn't name, so run `ls` first.
 | File | What it is |
 | --- | --- |
 | `ryuo_proto.py` | The wire format: framing, checksum, byte-stuffing, and every payload schema. No I/O — import it and build your own thing. |
+| `ryuo_hid.py` | The write/read loop the scripts share: one report out, then read until the reply *to that request* arrives. Works with any hidapi-style handle. |
 | `ryuo_send.py` | The daemon. Pushes config, then loops telemetry + colour animation. |
 | `ryuo_ctl.py` | Single-shot request/response tool for exploring. |
 | `PROTOCOL.md` | Full protocol writeup. |
 | `70-ryuo.rules` | udev rule so you don't have to run as root. The number is load-bearing — `uaccess` tags are only honoured by rule files sorting before systemd's `73-seat-late.rules`. |
 | `tests/test_proto.py` | Codec tests — framing, stuffing, checksum, payload shapes. No hardware needed. |
+| `tests/test_hid.py` | Tests for the read loop against a fake device — skipping other requests' replies, recovering from a stray fragment. No hardware needed. |
 | `tests/probe.py` | Interactive harness for the unknowns in PROTOCOL.md. Sends one request at a time and writes down what you saw. |
 | `tests/video_matrix.py` | Works out which video encodes actually play, holding the session open so a timeout can't masquerade as a decode failure. |
 | `captures/` | Raw evidence — Info Hub logcats, the recovery transcript, the split-zone measurement — that the docs are checked against. |
@@ -408,8 +412,10 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
   1,025 doesn't. `ryuo_proto.request()` refuses to build a longer frame. In
   practice only `config` gets near the limit, through a long playlist.
 * **Keep it under about 8 requests a second.** The device takes in roughly 11
-  reports a second and sends at most about 10 replies, so a faster host builds
-  a reply backlog that keeps growing. See PROTOCOL.md §1.
+  reports a second but sends back only about 8.5 replies (measured), so a
+  faster host builds a reply backlog that keeps growing. Replies then arrive
+  late, which is why every script here matches them to requests by
+  `AckNumber` rather than taking the next one. See PROTOCOL.md §1.
 * **The cooler logs everything you send it** to
   `/sdcard/catchlog/log/hidserver_log.txt` — CPU/GPU names, readout labels,
   playlists, and the serial number in `conn` replies — up to 50 MB before it
@@ -529,7 +535,8 @@ pytest tests/ -v                       # codec tests, no hardware needed
 
 `tests/test_proto.py` pins the wire format, including the worked example printed
 in PROTOCOL.md §2 as a golden vector — if the doc and the code ever drift apart,
-that test fails.
+that test fails. `tests/test_hid.py` covers the read loop: a reply that belongs
+to another request is skipped, never returned.
 
 For the things only hardware can answer:
 

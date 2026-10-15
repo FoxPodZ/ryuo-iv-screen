@@ -50,9 +50,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 
 import hid
+import ryuo_hid
 import ryuo_proto as proto
 
 VID, PID = proto.VID, proto.PID
@@ -94,50 +94,42 @@ def txn(h, method: str, resource: str, payload=None, seq: int = 1,
     in a pasted log unredacted.
     """
     frame = proto.request(method, resource, payload, seq=seq)
-
-    # same chunking as ryuo_send.py: one 1024-byte report at a time.
-    written = 0
-    for off in range(0, len(frame), proto.REPORT_SIZE):
-        chunk = frame[off:off + proto.REPORT_SIZE].ljust(proto.REPORT_SIZE, b"\x00")
-        n = h.write(b"\x00" + chunk)
-        if n < 0:
-            raise OSError("HID write failed")
-        written += n
-    print(f"--> {method} {resource} ({written} bytes, "
-          f"{len(frame) // proto.REPORT_SIZE} report(s))"
+    ryuo_hid.write_frame(h, frame)
+    # The frame always goes out as one 1024-byte report (PROTOCOL.md §2);
+    # its unpadded size is the number worth seeing, since 1024 is the limit.
+    size = len(frame.rstrip(b"\x00"))
+    print(f"--> {method} {resource} ({size} of {proto.REPORT_SIZE} bytes)"
           + (f"  {json.dumps(payload)}" if payload else ""))
 
-    buf = bytearray()
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        data = h.read(proto.REPORT_SIZE)
-        if data:
-            buf += bytes(data)
-            if buf.count(proto.START) >= 2:
-                s = buf.index(proto.START)
-                e = buf.index(proto.END, s + 1)
-                raw = bytes(buf[s:e + 1])
-                try:
-                    body = proto.decode(raw).decode(errors="replace")
-                except Exception as ex:
-                    print(f"<-- undecodable ({ex}): {raw[:48].hex(' ').upper()}")
-                    return None
-                if quiet:
-                    return body
-                head, _, content = body.partition("\r\n\r\n")
-                print("<--", head.replace("\r\n", " | "))
-                if content.strip():
-                    try:
-                        print(json.dumps(json.loads(content), indent=2)[:4000])
-                    except Exception:
-                        print(content[:4000])
-                else:
-                    print("    (empty body)")
-                return body
-        else:
-            time.sleep(0.02)
-    print("<-- (no reply)")
-    return None
+    # Run next to ryuo_send.py, this handle also receives every reply to
+    # ryuo_send's own requests. read_reply() skips them by AckNumber; count
+    # them rather than printing each one.
+    skipped = []
+    body = ryuo_hid.read_reply(h, seq, timeout, log=skipped.append)
+    undecodable = [m for m in skipped
+                   if m.startswith(ryuo_hid.SKIP_UNDECODABLE)]
+    foreign = len(skipped) - len(undecodable)
+    for m in undecodable:
+        print(f"<-- {m}")
+    if foreign:
+        print(f"    (skipped {foreign} repl{'y' if foreign == 1 else 'ies'} to "
+              f"other requests -- ryuo_send.py or Info Hub running?)")
+
+    if body is None:
+        print("<-- (no reply)")
+        return None
+    if quiet:
+        return body
+    head, _, content = body.partition("\r\n\r\n")
+    print("<--", head.replace("\r\n", " | "))
+    if content.strip():
+        try:
+            print(json.dumps(json.loads(content), indent=2)[:4000])
+        except Exception:
+            print(content[:4000])
+    else:
+        print("    (empty body)")
+    return body
 
 
 # ------------------------------------------------------------- media files

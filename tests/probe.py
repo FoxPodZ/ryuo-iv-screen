@@ -45,6 +45,7 @@ import time
 import hid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import ryuo_hid
 import ryuo_proto as proto
 
 RESULTS = os.path.join(os.path.dirname(__file__), "probe-results.md")
@@ -85,33 +86,54 @@ class Link:
         self.h.open_path(pick["path"])
         self.h.set_nonblocking(1)
         self.seq = 1
+        self._skipped = []       # read_reply() log, drained by send()
+        self._held = []          # skips seen by the keepalive thread
 
     def send(self, method, resource, payload=None, timeout=1.5):
+        main = threading.current_thread() is threading.main_thread()
         with self._lock:
-            return self._send_locked(method, resource, payload, timeout)
+            reply = self._send_locked(method, resource, payload, timeout)
+            skipped, self._skipped = self._skipped, []
+            if main:
+                skipped, self._held = self._held + skipped, []
+            else:
+                self._held += skipped    # keepalive: report on the next probe
+        if main:
+            self._warn_foreign(skipped)
+        return reply
 
     def _send_locked(self, method, resource, payload=None, timeout=1.5):
-        frame = proto.request(method, resource, payload, seq=self.seq)
+        """One request, and the reply to *it* -- matched on AckNumber.
+
+        This used to return the first frame that decoded. At the probe's own
+        pace that was usually right, since the keepalive and the probes share
+        the lock. It stopped being right the moment anything else had the
+        cooler open: every program with the node open gets a copy of every
+        reply, so with Info Hub running in the background each probe read
+        Info Hub's replies as its own answers.
+        """
+        seq = self.seq
         self.seq += 1
-        for off in range(0, len(frame), proto.REPORT_SIZE):
-            chunk = frame[off:off + proto.REPORT_SIZE].ljust(proto.REPORT_SIZE, b"\x00")
-            if self.h.write(b"\x00" + chunk) < 0:
-                return "<write failed>"
-        buf, deadline = bytearray(), time.time() + timeout
-        while time.time() < deadline:
-            data = self.h.read(proto.REPORT_SIZE)
-            if data:
-                buf += bytes(data)
-                if buf.count(proto.START) >= 2:
-                    s = buf.index(proto.START)
-                    e = buf.index(proto.END, s + 1)
-                    try:
-                        return proto.decode(bytes(buf[s:e + 1])).decode(errors="replace")
-                    except Exception as ex:
-                        return f"<undecodable: {ex}>"
-            else:
-                time.sleep(0.02)
-        return None
+        try:
+            ryuo_hid.write_frame(
+                self.h, proto.request(method, resource, payload, seq=seq))
+        except OSError:
+            return "<write failed>"
+        return ryuo_hid.read_reply(self.h, seq, timeout,
+                                   log=self._skipped.append)
+
+    def _warn_foreign(self, skipped):
+        foreign = [m for m in skipped if m.startswith(ryuo_hid.SKIP_FOREIGN)]
+        for m in skipped:
+            if m.startswith(ryuo_hid.SKIP_UNDECODABLE):
+                print(f"  !! {m}")
+        if foreign:
+            print(f"  !! {len(foreign)} repl{'y' if len(foreign) == 1 else 'ies'} "
+                  f"to someone else's requests arrived on this handle.")
+            print("  !! Another program is talking to the cooler (Info Hub? "
+                  "ryuo_send.py?). Close it --")
+            print("  !! its traffic changes what's on the panel, and earlier "
+                  "runs were contaminated exactly this way.")
 
     def known_good(self):
         """Put the screen back somewhere sane — WITH media playing.

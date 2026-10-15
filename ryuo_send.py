@@ -45,6 +45,7 @@ import time
 
 import hid
 
+import ryuo_hid
 import ryuo_proto as proto
 
 VID, PID = proto.VID, proto.PID
@@ -82,33 +83,20 @@ def open_device(vid: int | None, pid: int, index: int | None = None):
 
 
 def txn(h, method, resource, payload, seq, timeout=0.4, verbose=False):
-    frame = proto.request(method, resource, payload, seq=seq)
-    for off in range(0, len(frame), proto.REPORT_SIZE):
-        chunk = frame[off:off + proto.REPORT_SIZE].ljust(proto.REPORT_SIZE, b"\x00")
-        if h.write(b"\x00" + chunk) < 0:
-            raise OSError("HID write failed")
+    """Send one request; return the reply to it, or None.
 
-    buf, deadline = bytearray(), time.time() + timeout
-    while time.time() < deadline:
-        data = h.read(proto.REPORT_SIZE)
-        if data:
-            buf += bytes(data)
-            if buf.count(proto.START) >= 2:
-                s = buf.index(proto.START)
-                e = buf.index(proto.END, s + 1)
-                try:
-                    body = proto.decode(bytes(buf[s:e + 1])).decode(errors="replace")
-                except ValueError as ex:
-                    # a mangled reply is not worth killing the keepalive over
-                    if verbose:
-                        print(f"   <-- undecodable reply ({ex})")
-                    return None
-                if verbose:
-                    print("   <--", body.split("\r\n")[0])
-                return body
-        else:
-            time.sleep(0.01)
-    return None
+    Replies to other requests are skipped, not returned (ryuo_hid.read_reply).
+    That matters here more than anywhere: --rgb sends its preset pushes with
+    timeout=0 and never reads their replies, so they pile up ahead of the
+    telemetry reply. A mangled or missing reply is never worth killing the
+    keepalive over, so this never raises on the read side.
+    """
+    log = (lambda m: print(f"   .. {m}")) if verbose else None
+    body = ryuo_hid.transact(h, method, resource, payload, seq=seq,
+                             timeout=timeout, log=log)
+    if verbose and body:
+        print("   <--", body.split("\r\n", 1)[0])
+    return body
 
 
 # ------------------------------------------------------------------ telemetry

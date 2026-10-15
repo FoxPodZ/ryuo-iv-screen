@@ -298,6 +298,75 @@ def test_reply_json():
     assert proto.reply_json("1 200\r\n\r\nnot json") is None
 
 
+# --------------------------------------------------- matching replies to requests
+
+def _reply(ack=None, content=""):
+    return proto.build_body("1 200", content, ack=ack).decode()
+
+
+def test_reply_ack():
+    assert proto.reply_ack(_reply(ack=2)) == 2
+    assert proto.reply_ack(_reply()) is None                 # no header
+    assert proto.reply_ack("1 200\r\nAckNumber=x\r\n\r\n") is None
+    assert proto.reply_ack(None) is None
+    # only headers count: an AckNumber-looking line in the payload doesn't
+    assert proto.reply_ack("1 200\r\n\r\nAckNumber=5") is None
+
+
+def test_is_reply_to_matches_seq_plus_one():
+    assert proto.is_reply_to(_reply(ack=2), 1)
+    assert not proto.is_reply_to(_reply(ack=2), 2)           # someone else's
+    assert not proto.is_reply_to(_reply(ack=50001), 1)       # another program
+
+
+def test_is_reply_to_is_strict_about_missing_ack():
+    """Deliberate (see the docstring): no AckNumber is not a match."""
+    assert not proto.is_reply_to(_reply(), 1)
+    assert not proto.is_reply_to(None, 1)
+
+
+def _report(body: str) -> bytes:
+    return proto.pad_for_hid(proto.encode(body.encode()))
+
+
+def test_pop_reply_one_frame_then_padding():
+    buf = bytearray(_report(_reply(ack=2)))
+    assert proto.reply_ack(proto.pop_reply(buf)) == 2
+    assert proto.pop_reply(buf) is None and not buf          # padding dropped
+
+
+def test_pop_reply_waits_for_a_complete_frame():
+    full = proto.encode(_reply(ack=2).encode())
+    buf = bytearray(full[:20])
+    assert proto.pop_reply(buf) is None
+    assert buf == full[:20], "an incomplete frame must be kept, not dropped"
+    buf += full[20:]
+    assert proto.reply_ack(proto.pop_reply(buf)) == 2
+
+
+def test_pop_reply_resyncs_after_a_stray_tail():
+    """The second report of a long reply, without its first, then a real one.
+
+    The tail's closing 0x5A pairs with the next frame's opening 0x5A into a
+    candidate that can't decode. The old loops gave up there and threw the
+    real reply away with it.
+    """
+    long = proto.pad_for_hid(proto.encode(_reply(ack=8, content="x" * 1500).encode()))
+    tail = long[proto.REPORT_SIZE:]
+    errors = []
+    buf = bytearray(tail + _report(_reply(ack=10)))
+    body = proto.pop_reply(buf, on_error=lambda ex, raw: errors.append(ex))
+    assert proto.reply_ack(body) == 10
+    assert len(errors) == 1
+
+
+def test_pop_reply_takes_frames_in_order():
+    buf = bytearray(_report(_reply(ack=2)) + _report(_reply(ack=3)))
+    assert proto.reply_ack(proto.pop_reply(buf)) == 2
+    assert proto.reply_ack(proto.pop_reply(buf)) == 3
+    assert proto.pop_reply(buf) is None
+
+
 def test_device_identity():
     """The 0B05:19AF mixup cost real time. Pin it.
 

@@ -255,6 +255,85 @@ def reply_json(body: str | None):
         return None
 
 
+# ---------------------------------------------------------------- replies
+# Which reply belongs to which request. Pure functions; the read loop that
+# uses them lives in ryuo_hid.py, so this module stays free of I/O.
+#
+# Replies can't be taken in arrival order, for two reasons:
+#   * the device queues replies with no size limit and sends ~8.5 a second
+#     (PROTOCOL.md §1), so under load the next reply is an old one;
+#   * the host OS gives every program with the node open its own copy of
+#     every reply, so ryuo_ctl.py run next to ryuo_send.py sees both
+#     programs' replies.
+# The only thing tying a reply to its request is AckNumber = SeqNumber + 1.
+
+def reply_ack(body: str | None) -> int | None:
+    """AckNumber from a decoded reply's headers, or None if it has none."""
+    if not body:
+        return None
+    head = body.partition("\r\n\r\n")[0]
+    for line in head.split("\r\n")[1:]:
+        key, _, value = line.partition("=")
+        if key == "AckNumber":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def is_reply_to(body: str | None, seq: int) -> bool:
+    """True if `body` is the device's reply to the request sent with `seq`.
+
+    Strict on purpose: a reply with NO AckNumber does not match. Per the
+    source, SerialService builds AckNumber from the request's SeqNumber for
+    every reply, and request() always sends one, so a frame without it isn't
+    an answer to us -- taking it anyway is the same mistake as taking another
+    request's reply. If that assumption is ever wrong, the symptom is a
+    timeout plus a "skipped" log line naming the frame, not a silently wrong
+    answer.
+    """
+    return reply_ack(body) == seq + 1
+
+
+def pop_reply(buf: bytearray, on_error=None) -> str | None:
+    """Take the first complete frame off the front of `buf` and decode it.
+
+    Returns the reply body as text, or None if `buf` holds no complete frame
+    yet. Consumed bytes are removed from `buf`, so call it again for the next
+    frame. Leading zero padding is dropped.
+
+    A candidate that doesn't decode is skipped rather than ending the read,
+    and only up to -- not including -- its closing 0x5A, because that byte may
+    really be the start of the next frame. That is exactly what happens when
+    a reader picks up the second report of a long reply whose first report
+    someone else consumed: the tail's closing 0x5A pairs with the next
+    frame's opening one. `on_error(exc, raw)` is called for each candidate
+    skipped this way.
+    """
+    while True:
+        try:
+            s = buf.index(START)
+        except ValueError:
+            buf.clear()                       # padding or junk, nothing to keep
+            return None
+        del buf[:s]
+        try:
+            e = buf.index(END, 1)
+        except ValueError:
+            return None                       # frame not complete yet
+        raw = bytes(buf[:e + 1])
+        try:
+            body = decode(raw).decode(errors="replace")
+        except ValueError as ex:
+            if on_error:
+                on_error(ex, raw)
+            del buf[:e]                       # keep buf[e]: maybe a START
+            continue
+        del buf[:e + 1]
+        return body
+
+
 # ---------------------------------------------------------------- media files
 # There is NO upload over HID on this firmware, whatever the resource names
 # suggest. Confirmed on fw 1.0.10 unless marked:

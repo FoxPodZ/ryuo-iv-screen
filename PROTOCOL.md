@@ -133,6 +133,15 @@ answer to "the request just sent" will read stale ones. Match replies on
 `AckNumber`. `ryuo_send.py --rgb` at its default 10 pushes a second, plus
 telemetry, sits above that line.
 
+There is a second way to read someone else's reply, and it needs no load at
+all: **every program with the device open gets its own copy of every reply.**
+That's the host OS, not the cooler — each open HID handle has its own input
+buffer. So `ryuo_ctl.py` run next to `ryuo_send.py`, or a probe run with Info
+Hub open in the background, sees the other program's replies mixed in with
+its own. Matching on `AckNumber` handles this case too. The scripts here all
+read through `ryuo_hid.read_reply()`, which skips anything that isn't the
+reply to the request just sent.
+
 
 ## 2. Frame format
 
@@ -2046,14 +2055,23 @@ is on foxpodz.de and this section will be updated.
 
 The whole protocol is in `ryuo_proto.py` — framing, checksum, stuffing, and every payload builder — with no I/O in it. Roughly:
 
-1. Open the hidraw node for product id `1C76` (any vendor id) interface 0.
+1. Open the hidraw node for product id `1C76`, interface 0, with any vendor id
+   — the vendor id changes with firmware (§1). Match on the product id
+   **only**, and never on vendor `0B05` alone: `0B05:19AF` is likely the
+   motherboard's Aura LED controller.
 2. Build a frame: JSON payload → HTTP-ish body → `encode()`. It has to come
    to **1024 bytes or less** — anything longer is dropped without a reply
    (§2). Pad it to exactly 1024.
 3. Write it as one 1024-byte report with a report-ID byte in front.
 4. Read 1024-byte reports until you've seen two `0x5A`s, slice between them, unstuff, verify the checksum.
-   Replies can lag behind under load; match them to requests by `AckNumber`,
-   and keep the sustained rate under about 8 requests a second (§1).
+   A reply can span several reports, so keep reading until it's complete.
+   **Don't take the first reply that decodes.** Under load replies lag, and
+   other programs' replies arrive on your handle too (§1): keep reading until
+   `AckNumber` equals your `SeqNumber + 1`, skipping everything else. If a
+   candidate doesn't decode, drop it only up to its closing `0x5A` and look
+   again from there — that byte can be the start of the next frame.
+   `ryuo_hid.read_reply()` does all of this. Keep the sustained rate under
+   about 8 requests a second.
 5. Send `POST config` once. Wait ~1.6 s.
 6. Loop `POST all` every second, forever, or the screen goes back to stock.
    **Run this on a background thread, not between commands** — if your code
