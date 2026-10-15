@@ -98,6 +98,27 @@ def read_reply(h, seq: int, timeout: float, log=None) -> str | None:
             time.sleep(0.01)
 
 
+def drain(h, log=None) -> int:
+    """Read and decode whatever replies are already waiting, without blocking.
+
+    For a loop that sends on a fixed clock and doesn't need its replies:
+    waiting for one would stall the loop for as long as the device's reply
+    queue is deep. Returns how many replies were read; `log(body)` is called
+    for each. A long reply whose second report hasn't arrived yet is cut in
+    half here -- the next drain() or read_reply() resyncs past the tail.
+    """
+    buf, n = bytearray(), 0
+    while True:
+        data = h.read(proto.REPORT_SIZE)
+        if not data:
+            return n
+        buf += bytes(data)
+        while (body := proto.pop_reply(buf)) is not None:
+            n += 1
+            if log:
+                log(body)
+
+
 def transact(h, method: str, resource: str, payload=None, *, seq: int,
              timeout: float, log=None) -> str | None:
     """Send one request and return the body of the reply to it, or None.

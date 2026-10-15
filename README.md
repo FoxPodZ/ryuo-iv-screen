@@ -285,7 +285,12 @@ python ryuo_send.py --rgb both --rgb-mode thermal --demo-temp -1
 
 Thermal bands: `<34 °C` blue · `<61` green · `<81` yellow · `<96` red · `≥96` blinking light/dark red.
 
-This works because colour updates go out on the `preset` resource, which repaints the text views **without** tearing down the video player. Sending a full `config` at 10 fps would restart the media every frame; `preset` doesn't.
+This works because colour updates go out on the `preset` resource, which repaints the text views **without** tearing down the video player. Sending a full `config` that often would restart the media every frame; `preset` doesn't.
+
+Colours update 7 times a second by default (`--rgb-fps`). You can go higher,
+but the device only answers about 8.5 requests a second, telemetry included.
+Above that its reply queue grows for as long as `ryuo_send.py` runs, and
+`ryuo_ctl.py` stops getting answers. `ryuo_send.py` warns when you cross it.
 
 ### Media
 
@@ -418,8 +423,8 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
 * **Keep it under about 8 requests a second.** The device takes in roughly 11
   reports a second but sends back only about 8.5 replies (measured), so a
   faster host builds a reply backlog that keeps growing. Replies then arrive
-  late, which is why every script here matches them to requests by
-  `AckNumber` rather than taking the next one. See PROTOCOL.md §1.
+  late, which is why the scripts here never take the next reply as the
+  answer to the last request. See PROTOCOL.md §1.
 * **The cooler logs everything you send it** to
   `/sdcard/catchlog/log/hidserver_log.txt` — CPU/GPU names, readout labels,
   playlists, and the serial number in `conn` replies — up to 50 MB before it

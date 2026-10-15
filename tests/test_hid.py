@@ -102,3 +102,11 @@ def test_transact_with_zero_timeout_does_not_read():
     assert ryuo_hid.transact(h, proto.POST, proto.RES_PRESET, {}, seq=1,
                              timeout=0) is None
     assert len(h.inbox) == 1, "the reply must be left for a later read"
+
+
+def test_drain_reads_everything_waiting_without_blocking():
+    h = FakeHandle(report(2), report(3), report(4))
+    seen = []
+    assert ryuo_hid.drain(h, seen.append) == 3
+    assert [proto.reply_ack(b) for b in seen] == [2, 3, 4]
+    assert ryuo_hid.drain(h) == 0                 # nothing left, returns at once

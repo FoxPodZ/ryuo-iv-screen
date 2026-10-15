@@ -41,12 +41,19 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import hid
 
 import ryuo_hid
 import ryuo_proto as proto
+
+# The device answers about 8.5 requests a second and queues the rest with no
+# limit (PROTOCOL.md §1). 7 colour pushes plus 1 telemetry frame is the most
+# that stays under that; above ~8 in total the reply queue never drains.
+RGB_FPS = 7.0
+MAX_RATE = 8.0
 
 VID, PID = proto.VID, proto.PID
 
@@ -85,9 +92,9 @@ def txn(h, method, resource, payload, seq, timeout=0.4, verbose=False):
     """Send one request; return the reply to it, or None.
 
     Replies to other requests are skipped, not returned (ryuo_hid.read_reply).
-    That matters here more than anywhere: --rgb sends its preset pushes with
-    timeout=0 and never reads their replies, so they pile up ahead of the
-    telemetry reply. A mangled or missing reply is never worth killing the
+    Only the one-off requests use a timeout here (config, disconn). The main
+    loop sends with timeout=0 and drains replies without waiting -- see the
+    comment there. A mangled or missing reply is never worth killing the
     keepalive over, so this never raises on the read side.
     """
     log = (lambda m: print(f"   .. {m}")) if verbose else None
@@ -286,8 +293,11 @@ def main() -> None:
                     help="which temperature drives --rgb-mode thermal")
     ap.add_argument("--rgb-speed", type=float, default=0.2,
                     help="full hue rotations per second (default 0.2 = 5s)")
-    ap.add_argument("--rgb-fps", type=float, default=10.0,
-                    help="preset pushes per second while cycling")
+    ap.add_argument("--rgb-fps", type=float, default=RGB_FPS,
+                    help=f"preset pushes per second while cycling (default "
+                         f"{RGB_FPS:g}). The device answers ~8.5 requests a "
+                         f"second; much above {MAX_RATE - 1:g} its reply queue "
+                         f"grows without limit")
     ap.add_argument("--timezone", default=None,
                     help="IANA zone for the Date&Time widget; "
                          "defaults to the host's")
@@ -320,6 +330,13 @@ def main() -> None:
         print(f"WARNING: --interval {args.interval} is longer than the device "
               f"tolerates between POST all frames; the screen will revert "
               f"to stock between ticks. Keep it at ~1s.")
+    rate = (1 / max(args.interval, 0.1)
+            + (args.rgb_fps if args.rgb != "off" else 0))
+    if rate > MAX_RATE:
+        print(f"WARNING: {rate:.1f} requests a second is more than the device "
+              f"answers (~8.5). Its reply queue will grow for as long as this "
+              f"runs, and ryuo_ctl.py run alongside will stop getting replies. "
+              f"Lower --rgb-fps.")
 
     media = list(args.media)
     play_mode = args.play_mode
@@ -400,30 +417,72 @@ def main() -> None:
         print(f"rgb: {args.rgb} @ {args.rgb_speed}/s, {args.rgb_fps} pushes/s")
     print("looping (ctrl-c to stop)...")
 
+    # Nothing in this loop waits for a reply. ryuo_send never uses them, and
+    # waiting is what made --rgb jump: the telemetry reply queues behind the
+    # colour pushes' replies, so blocking on it froze the colour for up to
+    # 0.4 s once a second, and the next push skipped ahead to catch up with
+    # the clock. Instead every request goes out on a fixed clock with
+    # timeout=0, and whatever replies have arrived are drained without
+    # blocking, so the OS input buffer never fills. Keeping the total under
+    # MAX_RATE is what stops the device's reply queue growing (§1).
+    def show(body):
+        status = body.split("\r\n", 1)[0]
+        print(f"   <-- {status}  (ack {proto.reply_ack(body)})")
+    drain_log = show if args.verbose else None
+
+    # Telemetry is COLLECTED on its own thread and only SENT from this one.
+    # collect() runs nvidia-smi as a subprocess, which can take 50-200 ms, and
+    # doing that inline stalled the colour clock once a second -- a smaller
+    # version of the jump above. The thread re-polls the GPU every tick (`gpu`
+    # from before the loop is only a fallback for when nvidia-smi isn't there
+    # at all) and leaves the newest reading in `latest`; the loop sends
+    # whatever is newest. All HID I/O stays on this thread.
+    latest = {"stats": collect(psutil, gpu, readouts)}
+    stop = threading.Event()
+
+    def collector():
+        while not stop.wait(args.interval):
+            try:
+                latest["stats"] = collect(psutil, _nvidia() or gpu, readouts)
+            except Exception:
+                pass          # a failed reading is not worth the keepalive
+
+    threading.Thread(target=collector, daemon=True).start()
+
     started = time.time()
-    next_stats = 0.0
+    next_stats = next_push = time.monotonic()
+    push_period = 1.0 / max(args.rgb_fps, 0.5)
     last_stats = None
     try:
         while True:
-            now = time.time()
+            mono = time.monotonic()
+            ryuo_hid.drain(h, drain_log)
 
             # telemetry on its own cadence
-            if now >= next_stats:
-                # re-poll the GPU every tick; `gpu` from before the loop is
-                # only a fallback for when nvidia-smi isn't there at all
-                last_stats = collect(psutil, _nvidia() or gpu, readouts)
-                reply = txn(h, proto.POST, proto.RES_ALL, last_stats,
-                            seq, verbose=args.verbose)
+            if mono >= next_stats:
+                last_stats = latest["stats"]
+                txn(h, proto.POST, proto.RES_ALL, last_stats, seq, timeout=0)
                 if args.verbose:
-                    print(f"seq={seq}" + ("" if reply else "  (no reply)"))
+                    print(f"seq={seq}  POST all")
                 seq += 1
-                next_stats = now + args.interval
+                next_stats += args.interval
+                if next_stats < mono:          # fell behind: don't burst
+                    next_stats = mono + args.interval
 
             if args.rgb == "off":
-                time.sleep(min(0.05, args.interval))
+                time.sleep(max(0.0, min(0.05, next_stats - time.monotonic())))
                 continue
 
+            if time.monotonic() < next_push:
+                time.sleep(max(0.0, min(next_push, next_stats)
+                               - time.monotonic()))
+                continue
+            next_push += push_period
+            if next_push < time.monotonic():   # fell behind: don't burst
+                next_push = time.monotonic() + push_period
+
             # live colour update via `preset` (does not restart the video)
+            now = time.time()
             if args.rgb_mode == "thermal":
                 if args.demo_temp is not None:
                     # sweep 20->100C over 40s so every band is visible
@@ -447,12 +506,12 @@ def main() -> None:
             txn(h, proto.POST, proto.RES_PRESET,
                 proto.preset_payload(slots, title_color=title,
                                      content_color=value, opacity=args.opacity),
-                seq, timeout=0.0)
+                seq, timeout=0)
             seq += 1
-            time.sleep(1.0 / max(args.rgb_fps, 0.5))
     except KeyboardInterrupt:
         print("\nsending disconn...")
     finally:
+        stop.set()
         try:
             txn(h, proto.POST, proto.RES_DISCONN, None, seq)
         except Exception:

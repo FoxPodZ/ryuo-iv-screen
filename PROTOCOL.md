@@ -130,17 +130,26 @@ requests back to back:
 So a host sustaining more than roughly 8 requests a second builds a backlog of
 replies that keeps growing, and a client that treats "the next reply" as the
 answer to "the request just sent" will read stale ones. Match replies on
-`AckNumber`. `ryuo_send.py --rgb` at its default 10 pushes a second, plus
-telemetry, sits above that line.
+`AckNumber`. `ryuo_send.py` stays under that line: `--rgb` defaults to 7
+colour pushes a second plus one telemetry frame, and it warns if you ask for
+more than the device answers.
+
+A backlog also punishes a client that *waits* for its replies. Each one
+arrives only after everything queued ahead of it, so the wait grows with the
+queue. `ryuo_send.py` once waited up to 0.4 s for each telemetry reply, and
+with `--rgb` running the colour visibly froze and then jumped once a second.
+A loop on a fixed clock is better off not waiting at all: send, and read
+whatever replies have already arrived without blocking.
 
 There is a second way to read someone else's reply, and it needs no load at
 all: **every program with the device open gets its own copy of every reply.**
 That's the host OS, not the cooler — each open HID handle has its own input
 buffer. So `ryuo_ctl.py` run next to `ryuo_send.py`, or a probe run with Info
 Hub open in the background, sees the other program's replies mixed in with
-its own. Matching on `AckNumber` handles this case too. The scripts here all
-read through `ryuo_hid.read_reply()`, which skips anything that isn't the
-reply to the request just sent.
+its own. Matching on `AckNumber` handles this case too. Every script here
+that waits for a reply reads through `ryuo_hid.read_reply()`, which skips
+anything that isn't the reply to the request just sent; `ryuo_send.py`'s main
+loop doesn't wait for replies at all, and drains them with `ryuo_hid.drain()`.
 
 
 ## 2. Frame format
@@ -1391,7 +1400,7 @@ zone's own media view, with `Screensaver_left.mp4` on the main face and
 }
 ```
 
-This is `MainActivity` case **114**, and it's the useful one. It calls `setSysinfoDisplay` / `setSettings`, repaints the text views, and returns. It does **not** hide `mainParent` and does **not** tear down the video player — so you can hammer it at 10+ fps for colour animation while media keeps playing underneath.
+This is `MainActivity` case **114**, and it's the useful one. It calls `setSysinfoDisplay` / `setSettings`, repaints the text views, and returns. It does **not** hide `mainParent` and does **not** tear down the video player — so you can send it over and over for colour animation while media keeps playing underneath. The limit is the device's reply rate, not the panel: keep the total under about 8 requests a second (§1).
 
 That's the whole trick behind the rainbow and thermal modes in `ryuo_send.py`.
 
