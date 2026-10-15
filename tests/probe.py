@@ -77,8 +77,7 @@ class Link:
         devs = proto.find_devices(hid, vid, pid)
         if not devs:
             ids = f"{vid:04X}:{pid:04X}" if vid else f"????:{pid:04X}"
-            sys.exit(f"no HID device {ids} — cooler unplugged, "
-                     f"or Info Hub still running?")
+            sys.exit(f"no HID device {ids} — is the cooler plugged in?")
         pick = (devs[index] if index is not None else
                 next((d for d in devs
                       if d.get("interface_number") == proto.INTERFACE), devs[0]))

@@ -24,7 +24,7 @@
 ryuo_send.py — drive the ASUS ROG Ryuo IV screen with no ASUS software.
 
     pip install hidapi psutil
-    (close ASUS Info Hub first — it holds the HID handle)
+    (close ASUS Info Hub first — it talks to the cooler too)
 
     python ryuo_send.py --list
     python ryuo_send.py --config-only --items "CPU Temperature" "GPU Temperature" "Date&Time"
@@ -59,8 +59,7 @@ def open_device(vid: int | None, pid: int, index: int | None = None):
     devs = proto.find_devices(hid, vid, pid)
     if not devs:
         ids = f"{vid:04X}:{pid:04X}" if vid else f"????:{pid:04X}"
-        sys.exit(f"no HID device {ids} — cooler unplugged, "
-                 f"or Info Hub still running?")
+        sys.exit(f"no HID device {ids} — is the cooler plugged in?")
 
     if index is not None:
         if not 0 <= index < len(devs):

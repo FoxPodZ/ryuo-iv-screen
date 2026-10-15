@@ -205,7 +205,11 @@ device to whoever is physically logged in and takes it back on logout — so no
 If you're not on systemd, the file has a commented `plugdev` line instead. Or
 just run as root.
 
-**On Windows: close ASUS Info Hub first.** It holds the HID handle exclusively and you'll get nothing or broken behaviour until it's gone.
+**On Windows: close ASUS Info Hub first.** It doesn't lock the device — both
+can have it open at the same time — but it keeps talking to the cooler. Its
+telemetry keeps the session alive, which hides whether your own keepalive works
+(see the dead-man's switch below); the numbers on screen may be its readings
+rather than yours; and a config it pushes replaces the one you set.
 
 ---
 

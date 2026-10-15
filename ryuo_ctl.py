@@ -24,7 +24,7 @@
 ryuo_ctl.py — send single commands to the Ryuo IV screen and PRINT THE REPLY.
 
     pip install -r requirements.txt
-    (close ASUS Info Hub first — it holds the HID handle)
+    (close ASUS Info Hub first — it talks to the cooler too)
 
     python ryuo_ctl.py get config
     python ryuo_ctl.py get all
@@ -63,8 +63,8 @@ def open_dev(vid: int | None = None, pid: int = PID, index: int | None = None):
     devs = proto.find_devices(hid, vid, pid)
     if not devs:
         ids = f"{vid:04X}:{pid:04X}" if vid else f"????:{pid:04X}"
-        sys.exit(f"no HID device {ids} — cooler unplugged, "
-                 f"or Info Hub still running? (--list to see what enumerated)")
+        sys.exit(f"no HID device {ids} — is the cooler plugged in? "
+                 f"(--list to see what enumerated)")
 
     if index is not None:
         if not 0 <= index < len(devs):

@@ -270,7 +270,8 @@ def main() -> None:
                 print("  !! That means the problem is NOT your encode. Check:")
                 print("  !!   adb shell ls -l /sdcard/pcMediaPreset/")
                 print("  !!   - is the screen even taking config right now?")
-                print("  !!   - is Info Hub running and holding the HID handle?")
+                print("  !!   - is Info Hub running? It talks to the cooler too,")
+                print("  !!     and a config it pushes replaces yours.")
                 if ask("keep going anyway?", ("y", "n")) == "n":
                     break
     except KeyboardInterrupt:
