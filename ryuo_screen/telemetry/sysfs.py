@@ -127,6 +127,7 @@ class HwmonChip:
     path: Path
     device_id: str
     channels: Tuple[HwmonChannel, ...]
+    canonical_path: Path
 
 
 def enumerate_pci(sysfs: Sysfs) -> List[PciDevice]:
@@ -213,7 +214,7 @@ def enumerate_hwmon(sysfs: Sysfs) -> List[HwmonChip]:
             chip_id = "{}/{}".format(device_id, quote(name, safe=""))
             # The class alias can be reassigned when a device is removed.
             channels = _hwmon_channels(sysfs, chip_path, chip_id)
-            chips.append(HwmonChip(name, path, device_id, channels))
+            chips.append(HwmonChip(name, path, device_id, channels, chip_path))
     return chips
 
 

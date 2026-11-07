@@ -34,6 +34,8 @@ def test_gpu_identity_survives_hwmon_and_card_renumbering(tmp_path):
 
     assert first_chip.path == Path("class/hwmon/hwmon2")
     assert next_chip.path == Path("class/hwmon/hwmon9")
+    assert first_chip.canonical_path == first_channel.input_path.parent
+    assert next_chip.canonical_path == next_channel.input_path.parent
     assert first_chip.name == next_chip.name == "amdgpu"
     assert first_chip.device_id == next_chip.device_id == "pci/0000:03:00.0"
     assert first_pci == next_pci
