@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generic, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
+from urllib.parse import quote
 
 from ..models import SensorRef
 
@@ -45,19 +46,18 @@ class Sysfs:
             raise ValueError("path escapes the sysfs root: {}".format(path)) from None
 
     def _open(self, relative: RelativePath, flags: int) -> int:
-        # After resolving sysfs aliases, walk the canonical path by directory
-        # descriptors so a symlink inserted during a read cannot redirect it.
+        # Start at the filesystem anchor so a symlink inserted in either
+        # the sysfs root's ancestry or its descendants cannot redirect the open.
         parts = self._resolve(relative).parts
-        if not parts:
-            return os.open(self.root, flags | os.O_NOFOLLOW)
+        directories = self.root.parts[1:] + parts[:-1]
         dir_flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
-        fd = os.open(self.root, dir_flags)
+        fd = os.open(self.root.anchor, dir_flags)
         try:
-            for part in parts[:-1]:
+            for part in directories:
                 next_fd = os.open(part, dir_flags, dir_fd=fd)
                 os.close(fd)
                 fd = next_fd
-            return os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=fd)
+            return os.open(parts[-1] if parts else ".", flags | os.O_NOFOLLOW, dir_fd=fd)
         finally:
             os.close(fd)
 
@@ -175,7 +175,7 @@ def _hwmon_device_id(target: Path) -> Optional[str]:
     return "/".join(parts) if parts else None
 
 
-def _hwmon_channels(sysfs: Sysfs, path: Path, device_id: str) -> Tuple[HwmonChannel, ...]:
+def _hwmon_channels(sysfs: Sysfs, path: Path, chip_id: str) -> Tuple[HwmonChannel, ...]:
     channels = []
     for entry in sysfs._entries(path).value or ():
         match = _INPUT.fullmatch(entry)
@@ -184,7 +184,7 @@ def _hwmon_channels(sysfs: Sysfs, path: Path, device_id: str) -> Tuple[HwmonChan
             channels.append((kind, int(index), kind + index, path / entry))
     return tuple(
         HwmonChannel(
-            ref=SensorRef("hwmon", device_id, channel),
+            ref=SensorRef("hwmon", chip_id, channel),
             input_path=input_path,
             label=sysfs.read_text(path / (channel + "_label")).value,
             kind=kind,
@@ -200,13 +200,20 @@ def enumerate_hwmon(sysfs: Sysfs) -> List[HwmonChip]:
         if not _HWMON.fullmatch(entry):
             continue
         path = base / entry
-        name = sysfs.read_text(path / "name").value
-        target = sysfs._target(path / "device").value
+        chip_path = sysfs._target(path).value
+        if chip_path is None:
+            continue
+        name = sysfs.read_text(chip_path / "name").value
+        target = sysfs._target(chip_path / "device").value
         if not name or target is None:
             continue
         device_id = _hwmon_device_id(target)
         if device_id is not None:
-            chips.append(HwmonChip(name, path, device_id, _hwmon_channels(sysfs, path, device_id)))
+            # One physical device can register multiple named hwmon chips.
+            chip_id = "{}/{}".format(device_id, quote(name, safe=""))
+            # The class alias can be reassigned when a device is removed.
+            channels = _hwmon_channels(sysfs, chip_path, chip_id)
+            chips.append(HwmonChip(name, path, device_id, channels))
     return chips
 
 

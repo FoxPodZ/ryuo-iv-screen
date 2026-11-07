@@ -43,13 +43,16 @@ def test_gpu_identity_survives_hwmon_and_card_renumbering(tmp_path):
     assert (first_pci.vendor, first_pci.device, first_pci.class_code, first_pci.driver) == (
         "0x1002", "0x73bf", "0x030000", "amdgpu",
     )
-    assert first_channel.ref == next_channel.ref == SensorRef("hwmon", "pci/0000:03:00.0", "temp1")
+    assert first_channel.ref == next_channel.ref == SensorRef(
+        "hwmon", "pci/0000:03:00.0/amdgpu", "temp1"
+    )
     assert not any(
         alias in first_channel.ref.stable_id
         for alias in ("hwmon2", "hwmon9", "card1", "card0")
     )
-    assert first_channel.input_path == Path("class/hwmon/hwmon2/temp1_input")
-    assert next_channel.input_path == Path("class/hwmon/hwmon9/temp1_input")
+    pci_path = Path("devices/pci0000:00/0000:00:01.0/0000:03:00.0")
+    assert first_channel.input_path == pci_path / "hwmon/hwmon2/temp1_input"
+    assert next_channel.input_path == pci_path / "hwmon/hwmon9/temp1_input"
 
 
 def test_platform_hwmon_uses_canonical_device(tmp_path):
@@ -62,7 +65,7 @@ def test_platform_hwmon_uses_canonical_device(tmp_path):
     assert chip.device_id == "platform/nct6775.656"
     assert channel is not None
     assert channel.label is None
-    assert channel.ref == SensorRef("hwmon", "platform/nct6775.656", "fan2")
+    assert channel.ref == SensorRef("hwmon", "platform/nct6775.656/nct6775", "fan2")
 
 
 def test_read_number_applies_scale_and_preserves_parse_error(tmp_path):
@@ -177,3 +180,67 @@ def test_read_refuses_link_swapped_in_after_resolution(tmp_path, monkeypatch):
 
     assert read.value is None
     assert read.error is not None
+
+
+def test_read_refuses_root_parent_swapped_after_resolution(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    fake = SysfsBuilder(parent / "sys")
+    (fake.root / "input").write_text("safe", encoding="ascii")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_root = SysfsBuilder(outside / "sys")
+    (outside_root.root / "input").write_text("outside", encoding="ascii")
+    sysfs = Sysfs(fake.root)
+    original_resolve = Path.resolve
+
+    def resolve_then_swap(path, *args, **kwargs):
+        resolved = original_resolve(path, *args, **kwargs)
+        if path == fake.root / "input":
+            parent.rename(tmp_path / "moved")
+            fake.link(parent, outside)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_swap)
+    read = sysfs.read_text("input")
+
+    assert read.value is None
+    assert read.error is not None
+
+
+def test_different_chip_names_on_one_pci_device_have_distinct_sensor_refs(tmp_path):
+    fake = SysfsBuilder(tmp_path / "sys")
+    gpu = fake.pci()
+    fake.hwmon(gpu, 2, "amdgpu", {"temp1": (45000, "edge")})
+    fake.hwmon(gpu, 9, "boardmon", {"temp1": (37000, "board")})
+
+    first, second = enumerate_hwmon(Sysfs(fake.root))
+    assert first.device_id == second.device_id == "pci/0000:03:00.0"
+    first_channel, = first.channels
+    second_channel, = second.channels
+
+    assert first_channel.ref.channel == second_channel.ref.channel == "temp1"
+    assert first_channel.ref.stable_id != second_channel.ref.stable_id
+
+
+def test_recycled_hwmon_class_path_does_not_read_another_device(tmp_path):
+    fake = SysfsBuilder(tmp_path / "sys")
+    first = fake.pci()
+    second = fake.pci("0000:05:00.0")
+    old_chip_path = fake.hwmon(first, 2, "amdgpu", {"temp1": (45000, "edge")})
+    sysfs = Sysfs(fake.root)
+    old_chip, = enumerate_hwmon(sysfs)
+    old_channel, = old_chip.channels
+    assert sysfs.read_number(old_channel.input_path, 0.001).value == 45.0
+
+    (fake.root / "class/hwmon/hwmon2").unlink()
+    old_chip_path.rename(first / "removed-hwmon2")
+    fake.hwmon(second, 2, "amdgpu", {"temp1": (93000, "edge")})
+    new_chip, = enumerate_hwmon(sysfs)
+    new_channel, = new_chip.channels
+
+    assert old_channel.ref != new_channel.ref
+    assert sysfs.read_number(new_channel.input_path, 0.001).value == 93.0
+    stale = sysfs.read_number(old_channel.input_path, 0.001)
+    assert stale.value is None
+    assert stale.error is not None
