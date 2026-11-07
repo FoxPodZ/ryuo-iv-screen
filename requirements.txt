@@ -1,2 +1,4 @@
 hidapi>=0.14
 psutil>=5.9
+aiohttp>=3.8.6,<4
+tomli>=2; python_version<'3.11'

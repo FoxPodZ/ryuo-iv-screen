@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ryuo-iv-screen"
+version = "0.1.0"
+description = "Tools and protocol for the ASUS ROG Ryuo IV screen"
+requires-python = ">=3.8"
+license = {text = "GPL-3.0-or-later"}
+dependencies = [
+    "hidapi>=0.14",
+    "psutil>=5.9",
+    "aiohttp>=3.8.6,<4",
+    "tomli>=2; python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools]
+py-modules = ["ryuo_ctl", "ryuo_hid", "ryuo_proto", "ryuo_send"]
+
+[tool.setuptools.packages.find]
+include = ["ryuo_screen", "ryuo_screen.*"]
