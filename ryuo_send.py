@@ -38,8 +38,6 @@ from __future__ import annotations
 
 import argparse
 import platform
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -48,6 +46,12 @@ import hid
 
 import ryuo_hid
 import ryuo_proto as proto
+from ryuo_screen.telemetry.amd import AmdGpuProvider
+from ryuo_screen.telemetry.collector import TelemetryCollector
+from ryuo_screen.telemetry.cpu import CpuProvider
+from ryuo_screen.telemetry.hwmon import HwmonProvider
+from ryuo_screen.telemetry.nvidia import NvidiaProvider
+from ryuo_screen.telemetry.sysfs import Sysfs
 
 # The device answers about 8.5 requests a second and queues the rest with no
 # limit (PROTOCOL.md §1). 7 colour pushes plus 1 telemetry frame is the most
@@ -119,50 +123,18 @@ def _cpu_name() -> str:
     return platform.processor() or "CPU"
 
 
-_NVIDIA_SMI: str | None | bool = False      # False = not looked up yet
+_NVIDIA_PROVIDER = NvidiaProvider(include_vram=False)
+_NVIDIA_TELEMETRY = TelemetryCollector([])
+_LINUX_TELEMETRY: TelemetryCollector | None = None
 
 
 def _nvidia() -> dict:
-    """GPU stats via nvidia-smi, if present.
-
-    Call this EVERY telemetry tick. It used to be called once before the main
-    loop and the result reused for the lifetime of the process, which froze
-    every GPU field -- temperature, load, clock, power -- at whatever it read
-    at startup. The panel looked alive because the CPU figures next to it kept
-    moving.
-
-    Only the executable lookup is cached; the query itself is re-run.
-    """
-    global _NVIDIA_SMI
-    if _NVIDIA_SMI is False:
-        _NVIDIA_SMI = shutil.which("nvidia-smi")
-    if not _NVIDIA_SMI:
+    """Return the legacy NVIDIA name/stats dict, with a fresh query each tick."""
+    snapshot = _NVIDIA_PROVIDER.sample()
+    if not snapshot.measurements:
         return {}
-    q = ("name,temperature.gpu,utilization.gpu,power.draw,"
-         "clocks.current.graphics,fan.speed")
-    try:
-        out = subprocess.run(
-            [_NVIDIA_SMI, f"--query-gpu={q}", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2).stdout.strip().split("\n")[0]
-        name, temp, util, power, clock, fan = [x.strip() for x in out.split(",")]
-    except Exception:
-        return {}
-
-    # nvidia-smi prints "[N/A]" for anything the card can't report -- fan speed
-    # on laptops and passively cooled cards, power.draw on a lot of older GPUs.
-    # One unparseable field must not take the whole GPU with it, so each one
-    # degrades to 0 on its own.
-    def _num(x: str) -> int:
-        try:
-            return int(float(x))
-        except (TypeError, ValueError):
-            return 0
-
-    return {"name": name,
-            "stats": {"hasDedicated": True,
-                      "load": _num(util), "temperature": _num(temp),
-                      "fan": _num(fan), "speed": _num(clock),
-                      "power": _num(power), "voltage": 0}}
+    return {"name": _NVIDIA_PROVIDER.selected_name,
+            "stats": _NVIDIA_TELEMETRY.to_pc_info(snapshot)["gpu"]}
 
 
 def _cpu_temp(psutil) -> tuple[float, float]:
@@ -183,45 +155,81 @@ def _cpu_temp(psutil) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
-    vm = psutil.virtual_memory()
-    du = psutil.disk_usage("/" if platform.system() != "Windows" else "C:\\")
-    freq = psutil.cpu_freq()
-    load = psutil.cpu_percent()
-    t, tpkg = _cpu_temp(psutil)
-
+def _psutil_fans(psutil) -> list:
     fans = []
     try:
         for name, entries in (psutil.sensors_fans() or {}).items():
-            for e in entries:
-                fans.append({"onBoard": True, "name": e.label or name,
-                             "value": int(e.current)})
+            for entry in entries:
+                fans.append({"onBoard": True, "name": entry.label or name,
+                             "value": int(entry.current)})
     except Exception:
         pass
+    return fans
 
-    # Arbitrary labelled readouts. The screen renders any fans[] entry as
-    # "Fan Speed <name>", labelled with <name>, so this smuggles any number
-    # you can measure onto the panel. See proto.fan_item().
-    for label, value in (extra_readouts or {}).items():
-        fans.append({"onBoard": True, "name": label, "value": int(value)})
 
-    return proto.pc_info(
-        cpu={"load": int(load), "temperature": round(t), "temperaturePackage": round(tpkg),
-             "speedAverage": int(freq.current) if freq else 0,
-             "power": 0, "voltage": 0, "usage": int(load)},
-        gpu=gpu.get("stats") or {"hasDedicated": False, "load": 0, "temperature": 0,
-                                 "fan": 0, "speed": 0, "power": 0, "voltage": 0},
-        memory={"total": vm.total // (1024 ** 2),      # MB
-                "used": vm.used // (1024 ** 2),
-                "load": int(vm.percent), "temperature": 0, "speed": 0},
-        disk={"total": du.total // (1024 ** 3),        # GB
-              "used": du.used // (1024 ** 3),
-              "load": int(du.percent), "activity": 0,
-              "temperature": 0, "readSpeed": 0, "writeSpeed": 0},
-        network={"upload": 0, "download": 0},
-        motherboard={"temperature": 0, "chipsetTemperature": 0},
-        fans=fans,
-    )
+def _linux_telemetry() -> TelemetryCollector:
+    global _LINUX_TELEMETRY
+    if _LINUX_TELEMETRY is None:
+        sysfs = Sysfs()
+        _LINUX_TELEMETRY = TelemetryCollector([
+            CpuProvider(sysfs), HwmonProvider(sysfs), AmdGpuProvider(sysfs),
+        ])
+    return _LINUX_TELEMETRY
+
+
+def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
+    system = platform.system()
+    vm = psutil.virtual_memory()
+    du = psutil.disk_usage("C:\\" if system == "Windows" else "/")
+    memory = {"total": vm.total // (1024 ** 2), "used": vm.used // (1024 ** 2),
+              "load": int(vm.percent), "temperature": 0, "speed": 0}
+    disk = {"total": du.total // (1024 ** 3), "used": du.used // (1024 ** 3),
+            "load": int(du.percent), "activity": 0,
+            "temperature": 0, "readSpeed": 0, "writeSpeed": 0}
+    if system == "Linux":
+        collector = _linux_telemetry()
+        snapshot = collector.sample()
+        result = collector.to_pc_info(snapshot)
+        result.update(memory=memory, disk=disk)
+        if not result["fans"]:
+            result["fans"] = _psutil_fans(psutil)
+        cpu = result["cpu"]
+        available = {key for key, reading in snapshot.measurements.items() if reading.available}
+        if "cpu.load" not in available:
+            cpu["load"] = int(psutil.cpu_percent())
+            if "cpu.usage" not in snapshot.measurements:
+                cpu["usage"] = cpu["load"]
+        if "cpu.frequency" not in available:
+            freq = psutil.cpu_freq()
+            cpu["speedAverage"] = int(freq.current) if freq else 0
+        if not {"cpu.temperature", "cpu.temperature.package"} <= available:
+            temp, package = _cpu_temp(psutil)
+            if "cpu.temperature" not in available:
+                cpu["temperature"] = round(temp)
+            if "cpu.temperature.package" not in available:
+                cpu["temperaturePackage"] = round(package)
+        if gpu.get("stats"):
+            result["gpu"] = gpu["stats"]
+    else:
+        freq = psutil.cpu_freq()
+        load = psutil.cpu_percent()
+        temp, package = _cpu_temp(psutil)
+        result = proto.pc_info(
+            cpu={"load": int(load), "temperature": round(temp), "temperaturePackage": round(package),
+                 "speedAverage": int(freq.current) if freq else 0,
+                 "power": 0, "voltage": 0, "usage": int(load)},
+            gpu=gpu.get("stats") or {"hasDedicated": False, "load": 0, "temperature": 0,
+                                     "fan": 0, "speed": 0, "power": 0, "voltage": 0},
+            memory=memory,
+            disk=disk,
+            fans=_psutil_fans(psutil),
+        )
+
+    # An explicit --readout may still use the dynamic "Fan Speed <name>"
+    # widget. Native telemetry never maps other measurements to this widget.
+    result["fans"].extend({"onBoard": True, "name": label, "value": int(value)}
+                          for label, value in (extra_readouts or {}).items())
+    return result
 
 
 # ------------------------------------------------------------------ main
