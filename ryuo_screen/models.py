@@ -15,7 +15,10 @@ class SensorRef:
     channel: str
 
     def __post_init__(self) -> None:
-        if any("\x00" in part for part in (self.provider, self.device, self.channel)):
+        parts = (self.provider, self.device, self.channel)
+        if any(not isinstance(part, str) for part in parts):
+            raise TypeError("sensor reference components must be strings")
+        if any("\x00" in part for part in parts):
             raise ValueError("sensor references cannot contain NUL")
 
     def to_dict(self) -> Dict[str, str]:

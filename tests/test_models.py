@@ -51,6 +51,19 @@ def test_sensor_ref_rejects_nul(field):
         SensorRef.from_dict(data)
 
 
+@pytest.mark.parametrize("field", ["provider", "device", "channel"])
+@pytest.mark.parametrize("from_json", [False, True])
+def test_sensor_ref_rejects_non_string_components(field, from_json):
+    data = {"provider": "hwmon", "device": "amdgpu", "channel": "temp1"}
+    data[field] = []
+
+    with pytest.raises(TypeError):
+        if from_json:
+            SensorRef.from_dict(json.loads(json.dumps(data)))
+        else:
+            SensorRef(**data)
+
+
 def test_sensor_descriptor_fields():
     ref = SensorRef("hwmon", "0000:03:00.0", "temp1")
     descriptor = SensorDescriptor(ref, "gpu.temperature", "GPU edge", "°C")
