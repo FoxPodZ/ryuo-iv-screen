@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 import ryuo_hid
 import ryuo_proto as proto
 
-from .models import CommandResult
+from .models import CommandResult, SensorDescriptor, TelemetrySnapshot
 from .store import ScreenState
 
 
@@ -251,6 +251,24 @@ class DeviceStatus:
     uptime: float = 0.0
 
 
+@dataclass(frozen=True)
+class LatestTelemetry:
+    """Defensive latest structured sample captured by the HID owner thread."""
+
+    snapshot: Optional[TelemetrySnapshot] = None
+    catalog: Tuple[SensorDescriptor, ...] = ()
+    error: Optional[str] = "telemetry has not been sampled"
+
+    def __post_init__(self) -> None:
+        if self.snapshot is not None and not isinstance(self.snapshot, TelemetrySnapshot):
+            raise TypeError("snapshot must be a TelemetrySnapshot")
+        object.__setattr__(self, "catalog", tuple(self.catalog))
+        if any(not isinstance(item, SensorDescriptor) for item in self.catalog):
+            raise TypeError("catalog entries must be SensorDescriptor values")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("telemetry error must be a string")
+
+
 @dataclass
 class _Queued:
     order: int
@@ -315,6 +333,7 @@ class DeviceWorker:
         self._had_failure = False
         self._started_at: Optional[float] = None
         self._last_safe = proto.pc_info(timestamp_ms=0)
+        self._latest_telemetry = LatestTelemetry()
         self._next_keepalive: Optional[float] = None
         self._last_loop_clock: Optional[float] = None
         self._session_active = False
@@ -412,6 +431,11 @@ class DeviceWorker:
                 uptime=(0.0 if self._started_at is None
                         else max(0.0, now - self._started_at)),
             )
+
+    def latest_telemetry(self) -> LatestTelemetry:
+        """Return a non-collecting copy safe for HTTP/event-loop consumers."""
+        with self._condition:
+            return copy.deepcopy(self._latest_telemetry)
 
     def _run(self) -> None:
         backoff_index = 0
@@ -630,6 +654,11 @@ class DeviceWorker:
             telemetry_ok = False
             payload = self._last_safe
             with self._condition:
+                self._latest_telemetry = LatestTelemetry(
+                    self._latest_telemetry.snapshot,
+                    self._latest_telemetry.catalog,
+                    str(exc),
+                )
                 self._last_error = "telemetry: {}".format(exc)
                 if self._connected:
                     self._phase = "degraded"
@@ -645,9 +674,16 @@ class DeviceWorker:
     def _collect_telemetry(self) -> Mapping[str, Any]:
         if callable(self._telemetry):
             value = self._telemetry()
+            with self._condition:
+                self._latest_telemetry = LatestTelemetry(
+                    error="structured telemetry is unavailable from callable source"
+                )
         else:
             snapshot = self._telemetry.sample()
             value = self._telemetry.to_pc_info(snapshot)
+            catalog = tuple(self._telemetry.catalog())
+            with self._condition:
+                self._latest_telemetry = LatestTelemetry(snapshot, catalog, None)
         if not isinstance(value, Mapping):
             raise TypeError("telemetry source must return a mapping")
         return dict(value)
@@ -770,5 +806,6 @@ class DeviceWorker:
 
 __all__ = [
     "ApplyPlan", "CommandTicket", "DeviceCommand", "DeviceStatus",
-    "DeviceTransport", "DeviceWorker", "HidTransport", "plan_state_change",
+    "DeviceTransport", "DeviceWorker", "HidTransport", "LatestTelemetry",
+    "plan_state_change",
 ]

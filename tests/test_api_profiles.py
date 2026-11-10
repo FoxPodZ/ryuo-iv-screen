@@ -5,6 +5,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, create_app
+from ryuo_screen.device import LatestTelemetry
 from ryuo_screen.models import CommandResult, TelemetrySnapshot
 from ryuo_screen.store import ProfileStore, ScreenState, StateStore
 
@@ -24,6 +25,9 @@ class FakeDevice:
 
     def status(self):
         return type("Status", (), {"phase": "disconnected", "connected": False})()
+
+    def latest_telemetry(self):
+        return LatestTelemetry()
 
 
 class FakeTelemetry:

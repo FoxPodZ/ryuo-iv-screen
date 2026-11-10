@@ -11,7 +11,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from aiohttp import web
 
-from .device import DeviceCommand
+from .device import DeviceCommand, LatestTelemetry
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
 from .store import (
     Profile,
@@ -144,21 +144,13 @@ class AppContext:
             self.sse = SseHub(self.snapshot_document())
 
     def snapshot_document(self) -> Dict[str, Any]:
+        latest = _latest_telemetry(self.device)
         document: Dict[str, Any] = {
             "revision": self.state.revision,
             "state": self.state.to_dict(),
             "device": _device_document(self.device.status()),
+            "telemetry": _latest_telemetry_document(latest),
         }
-        try:
-            document["telemetry"] = _telemetry_document(
-                self.telemetry.sample(), self.telemetry.catalog()
-            )
-        except Exception as exc:
-            document["telemetry"] = {
-                "sampledAt": None,
-                "measurements": {},
-                "errors": {"collector": str(exc)},
-            }
         return document
 
     def publish_snapshot(self) -> int:
@@ -288,6 +280,32 @@ def _telemetry_document(
         },
         "errors": dict(snapshot.errors),
     }
+
+
+def _latest_telemetry(device: Any) -> LatestTelemetry:
+    accessor = getattr(device, "latest_telemetry", None)
+    if not callable(accessor):
+        return LatestTelemetry(error="device telemetry cache is unavailable")
+    try:
+        latest = accessor()
+    except Exception as exc:
+        return LatestTelemetry(error="device telemetry cache failed: {}".format(exc))
+    if not isinstance(latest, LatestTelemetry):
+        return LatestTelemetry(error="device returned an invalid telemetry cache")
+    return latest
+
+
+def _latest_telemetry_document(latest: LatestTelemetry) -> Dict[str, Any]:
+    if latest.snapshot is None:
+        return {
+            "sampledAt": None,
+            "measurements": {},
+            "errors": {"collector": latest.error or "telemetry has not been sampled"},
+        }
+    document = _telemetry_document(latest.snapshot, latest.catalog)
+    if latest.error:
+        document["errors"].setdefault("collector", latest.error)
+    return document
 
 
 def _result_document(result: CommandResult, revision: int) -> Dict[str, Any]:
@@ -431,15 +449,18 @@ async def _get_state(request: web.Request) -> web.Response:
 
 async def _get_telemetry(request: web.Request) -> web.Response:
     context: AppContext = request.app[CONTEXT_KEY]
-    descriptors = tuple(context.telemetry.catalog())
-    return web.json_response(_telemetry_document(context.telemetry.sample(), descriptors))
+    return web.json_response(
+        _latest_telemetry_document(_latest_telemetry(context.device))
+    )
 
 
 async def _get_sensors(request: web.Request) -> web.Response:
     context: AppContext = request.app[CONTEXT_KEY]
-    return web.json_response(
-        {"sensors": [_descriptor_document(item) for item in context.telemetry.catalog()]}
-    )
+    latest = _latest_telemetry(context.device)
+    return web.json_response({
+        "sensors": [_descriptor_document(item) for item in latest.catalog],
+        "error": latest.error,
+    })
 
 
 async def _get_device(request: web.Request) -> web.Response:

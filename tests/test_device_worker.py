@@ -5,7 +5,8 @@ import time
 from dataclasses import replace
 
 import ryuo_proto as proto
-from ryuo_screen.device import DeviceCommand, DeviceWorker
+from ryuo_screen.device import DeviceCommand, DeviceWorker, LatestTelemetry
+from ryuo_screen.models import Measurement, SensorDescriptor, SensorRef, TelemetrySnapshot
 from ryuo_screen.store import ScreenState
 
 
@@ -203,3 +204,88 @@ def test_sequence_growth_cannot_turn_accepted_command_into_unfinished_ticket():
     finally:
         worker.stop()
     assert not any(call[3] == "borderline" for call in transport.calls)
+
+
+def test_latest_telemetry_cache_is_populated_only_by_owner_thread_and_is_defensive():
+    class RecordingTelemetry:
+        def __init__(self):
+            self.sample_threads = []
+            self.catalog_threads = []
+            self.ref = SensorRef("test", "device", "temp1")
+
+        def sample(self):
+            self.sample_threads.append(threading.get_ident())
+            return TelemetrySnapshot(
+                {
+                    "cpu.temperature": Measurement(
+                        self.ref, "cpu.temperature", 41.0, "C", time.time()
+                    )
+                },
+                time.time(),
+            )
+
+        def catalog(self):
+            self.catalog_threads.append(threading.get_ident())
+            return (
+                SensorDescriptor(
+                    self.ref, "cpu.temperature", "CPU", "C", source="/sys/test/temp1"
+                ),
+            )
+
+        def to_pc_info(self, snapshot):
+            return proto.pc_info(cpu={"temperature": 41}, timestamp_ms=1)
+
+    transport = FakeTransport()
+    telemetry = RecordingTelemetry()
+    worker = DeviceWorker(
+        transport,
+        telemetry,
+        state=ScreenState(),
+        keepalive_interval=0.02,
+        settle_seconds=0,
+        max_rate=200,
+    )
+    initial = worker.latest_telemetry()
+    assert isinstance(initial, LatestTelemetry)
+    assert initial.snapshot is None
+    assert initial.error == "telemetry has not been sampled"
+
+    worker.start()
+    try:
+        _wait(lambda: len(telemetry.sample_threads) >= 2)
+        owner_ids = {call[0] for call in transport.calls}
+        assert set(telemetry.sample_threads + telemetry.catalog_threads) == owner_ids
+        cached = worker.latest_telemetry()
+        assert cached.error is None
+        assert cached.snapshot.measurements["cpu.temperature"].value == 41.0
+        assert cached.catalog[0].source == "/sys/test/temp1"
+        cached.snapshot.measurements.clear()
+        assert "cpu.temperature" in worker.latest_telemetry().snapshot.measurements
+        # Reading from this test thread never calls the provider.
+        before = (len(telemetry.sample_threads), len(telemetry.catalog_threads))
+        worker.latest_telemetry()
+        assert (len(telemetry.sample_threads), len(telemetry.catalog_threads)) == before
+    finally:
+        worker.stop()
+
+
+def test_latest_telemetry_cache_reports_error_when_first_collection_fails():
+    class BrokenTelemetry:
+        def sample(self):
+            raise RuntimeError("collector unavailable")
+
+    worker = DeviceWorker(
+        FakeTransport(),
+        BrokenTelemetry(),
+        state=ScreenState(),
+        keepalive_interval=0.02,
+        settle_seconds=0,
+        max_rate=200,
+    )
+    worker.start()
+    try:
+        _wait(lambda: worker.latest_telemetry().error == "collector unavailable")
+        assert worker.latest_telemetry().snapshot is None
+        assert worker.latest_telemetry().catalog == ()
+    finally:
+        worker.stop()

@@ -7,7 +7,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, SseHub, create_app
-from ryuo_screen.device import DeviceStatus
+from ryuo_screen.device import DeviceStatus, LatestTelemetry
 from ryuo_screen.models import TelemetrySnapshot
 from ryuo_screen.store import ProfileStore, ScreenState, StateStore
 
@@ -45,9 +45,15 @@ async def test_hub_initial_reconnect_and_slow_subscriber_keeps_only_newest():
 class _Device:
     def __init__(self):
         self.submit_count = 0
+        self.latest_reads = 0
+        self.latest = LatestTelemetry()
 
     def status(self):
         return DeviceStatus()
+
+    def latest_telemetry(self):
+        self.latest_reads += 1
+        return self.latest
 
 
 class _Telemetry:
@@ -97,21 +103,27 @@ async def test_sse_endpoint_emits_snapshot_heartbeat_and_cleans_disconnect(tmp_p
 
 @pytest.mark.asyncio
 async def test_app_lifecycle_publishes_live_telemetry_without_mutations_and_stops(tmp_path):
-    class ChangingTelemetry(_Telemetry):
+    class ForbiddenTelemetry(_Telemetry):
         def __init__(self):
-            self.samples = 0
+            self.calls = 0
 
         def sample(self):
-            self.samples += 1
-            return TelemetrySnapshot({}, float(self.samples))
+            self.calls += 1
+            raise AssertionError("aiohttp must not sample the mutable collector")
 
-    telemetry = ChangingTelemetry()
+        def catalog(self):
+            self.calls += 1
+            raise AssertionError("aiohttp must not probe the mutable collector")
+
+    telemetry = ForbiddenTelemetry()
+    device = _Device()
+    device.latest = LatestTelemetry(TelemetrySnapshot({}, 7.0), (), None)
     state_store = StateStore(tmp_path / "state.json")
     state_store.save(ScreenState(refresh_interval=0.02))
     context = AppContext(
         state_store,
         ProfileStore(tmp_path / "profiles"),
-        _Device(),
+        device,
         telemetry,
     )
     client = TestClient(TestServer(create_app(context)))
@@ -123,7 +135,8 @@ async def test_app_lifecycle_publishes_live_telemetry_without_mutations_and_stop
                 break
             await asyncio.sleep(0.01)
         assert context.sse.last_event_id >= initial_id + 3
-        assert telemetry.samples >= 4  # initial snapshot plus periodic updates
+        assert device.latest_reads >= 4  # initial snapshot plus periodic updates
+        assert telemetry.calls == 0
         assert context.live_publisher_running
     finally:
         await client.close()
@@ -131,6 +144,68 @@ async def test_app_lifecycle_publishes_live_telemetry_without_mutations_and_stop
     assert not context.live_publisher_running
     await asyncio.sleep(0.05)
     assert context.sse.last_event_id == stopped_id
+
+
+@pytest.mark.asyncio
+async def test_live_publisher_uses_fast_worker_cache_without_blocking_event_loop(tmp_path):
+    class SlowForbiddenTelemetry(_Telemetry):
+        def sample(self):
+            import time
+
+            time.sleep(0.25)
+            raise AssertionError("slow collector called from event loop")
+
+        def catalog(self):
+            raise AssertionError("catalog called from event loop")
+
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.save(ScreenState(refresh_interval=0.01))
+    device = _Device()
+    device.latest = LatestTelemetry(TelemetrySnapshot({}, 9.0), (), None)
+    context = AppContext(
+        state_store,
+        ProfileStore(tmp_path / "profiles"),
+        device,
+        SlowForbiddenTelemetry(),
+    )
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        for _ in range(8):
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    client = TestClient(TestServer(create_app(context)))
+    await client.start_server()
+    try:
+        await asyncio.wait_for(ticker(), 0.15)
+        assert ticks == 8
+        assert context.sse.last_event_id >= 4
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_reports_cache_unavailable_before_first_device_sample(tmp_path):
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.save(ScreenState())
+    context = AppContext(
+        state_store,
+        ProfileStore(tmp_path / "profiles"),
+        _Device(),
+        _Telemetry(),
+    )
+    client = TestClient(TestServer(create_app(context)))
+    await client.start_server()
+    try:
+        telemetry = await (await client.get("/api/v1/telemetry")).json()
+        sensors = await (await client.get("/api/v1/sensors")).json()
+    finally:
+        await client.close()
+    assert telemetry["measurements"] == {}
+    assert telemetry["errors"]["collector"] == "telemetry has not been sampled"
+    assert sensors == {"sensors": [], "error": "telemetry has not been sampled"}
 
 
 @pytest.mark.asyncio

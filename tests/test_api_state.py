@@ -6,7 +6,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, create_app
-from ryuo_screen.device import DeviceStatus
+from ryuo_screen.device import DeviceStatus, LatestTelemetry
 from ryuo_screen.models import (
     CommandResult,
     Measurement,
@@ -30,6 +30,7 @@ class FakeDevice:
         self.commands = []
         self.state_seen_on_submit = []
         self.store = None
+        self.latest = LatestTelemetry()
 
     def submit(self, command):
         self.commands.append(command)
@@ -47,6 +48,9 @@ class FakeDevice:
             model="Ryuo IV",
             firmware="1.2.3",
         )
+
+    def latest_telemetry(self):
+        return self.latest
 
 
 class FakeTelemetry:
@@ -95,6 +99,10 @@ async def _client(tmp_path, state=None):
         profile_store=ProfileStore(tmp_path / "profiles"),
         device=device,
         telemetry=FakeTelemetry(),
+    )
+    telemetry = context.telemetry
+    device.latest = LatestTelemetry(
+        telemetry.snapshot_value, tuple(telemetry.catalog()), None
     )
     client = TestClient(TestServer(create_app(context)))
     await client.start_server()
