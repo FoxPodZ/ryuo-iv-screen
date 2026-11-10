@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import asyncio
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -155,6 +157,67 @@ def test_adb_pull_uses_selected_device_and_exact_safe_remote_directory(tmp_path)
         "/bin/adb", "-s", "A", "pull", "/sdcard/pcMediaPreset/MiKu.PNG", str(factory),
     ]
     assert all("shell" not in kwargs for _, kwargs in calls)
+
+
+def test_adb_pull_cannot_deadlock_on_progress_larger_than_pipe_capacity(tmp_path):
+    progress = b"x" * (1024 * 1024)
+
+    def run(argv, **kwargs):
+        return Result("List of devices attached\nA\tdevice product:x\n")
+
+    class NoisyProcess:
+        def __init__(self, argv, **kwargs):
+            self.returncode = 0
+            self.blocked = kwargs.get("stdout") == subprocess.PIPE and len(progress) > 65536
+            Path(argv[-1]).write_bytes(b"valid-media")
+
+        def poll(self):
+            return None if self.blocked else self.returncode
+
+        def communicate(self):
+            return (progress, b"")
+
+        def kill(self):
+            self.blocked = False
+            self.returncode = -9
+
+    destination = tmp_path / "pulled.mp4"
+    adb = AdbBackend(
+        serial="A", runner=run, popen=NoisyProcess,
+        which=lambda name: "/bin/adb", timeout=0.05,
+    )
+    started = time.monotonic()
+    assert adb.pull("clip.mp4", destination, max_bytes=32) is True
+    assert time.monotonic() - started < 0.5
+    assert destination.read_bytes() == b"valid-media"
+
+
+@pytest.mark.parametrize("mode", ["failure", "timeout"])
+def test_adb_pull_failure_and_timeout_remove_partial_destination(tmp_path, mode):
+    def run(argv, **kwargs):
+        return Result("List of devices attached\nA\tdevice product:x\n")
+
+    class BrokenProcess:
+        def __init__(self, argv, **kwargs):
+            self.returncode = 1 if mode == "failure" else None
+            Path(argv[-1]).write_bytes(b"partial")
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self):
+            return (b"", b"failed")
+
+        def kill(self):
+            self.returncode = -9
+
+    destination = tmp_path / "partial.mp4"
+    adb = AdbBackend(
+        serial="A", runner=run, popen=BrokenProcess,
+        which=lambda name: "/bin/adb", timeout=0.03,
+    )
+    assert adb.pull("clip.mp4", destination, max_bytes=32) is False
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("stdout,serial,available", [

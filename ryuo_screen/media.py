@@ -364,7 +364,10 @@ class AdbBackend:
         deadline = time.monotonic() + self._timeout
         try:
             process = self._popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                # adb progress/error text is not part of the API contract.
+                # Discard it so a verbose transfer cannot fill an unread pipe
+                # while this loop monitors timeout and destination size.
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             while process.poll() is None:
                 if destination.exists() and destination.stat().st_size > max_bytes:
