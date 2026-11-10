@@ -12,6 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from aiohttp import web
 
 from .device import DeviceCommand, LatestTelemetry
+from .media import MediaManager, ToolUnavailable
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
 from .store import (
     Profile,
@@ -133,6 +134,7 @@ class AppContext:
     telemetry: Any
     sse: Optional[SseHub] = None
     sse_heartbeat: float = 15.0
+    media: Optional[MediaManager] = None
 
     def __post_init__(self) -> None:
         if self.sse_heartbeat <= 0:
@@ -428,6 +430,14 @@ async def _errors(request: web.Request, handler):
             {"error": "not_found", "message": "profile {!r} was not found".format(exc.args[0])},
             status=404,
         )
+    except FileNotFoundError as exc:
+        return web.json_response(
+            {"error": "not_found", "message": str(exc)}, status=404
+        )
+    except ToolUnavailable as exc:
+        return web.json_response(
+            {"error": "tool_unavailable", "message": str(exc)}, status=503
+        )
     except ProfileConflict as exc:
         return web.json_response(
             {"error": "conflict", "message": str(exc)}, status=409
@@ -466,6 +476,58 @@ async def _get_sensors(request: web.Request) -> web.Response:
 async def _get_device(request: web.Request) -> web.Response:
     context: AppContext = request.app[CONTEXT_KEY]
     return web.json_response(_device_document(context.device.status()))
+
+
+def _media_manager(request: web.Request) -> MediaManager:
+    context: AppContext = request.app[CONTEXT_KEY]
+    if context.media is None:
+        raise web.HTTPServiceUnavailable(
+            text=json.dumps({
+                "error": "media_unavailable",
+                "message": "media pipeline is not configured",
+            }),
+            content_type="application/json",
+        )
+    return context.media
+
+
+async def _get_media(request: web.Request) -> web.Response:
+    manager = _media_manager(request)
+    document = manager.catalog().to_dict()
+    document["tools"] = manager.tools.status()
+    # ``adb devices`` may start the daemon and wait up to its bounded timeout;
+    # never hold the aiohttp loop while it runs.
+    availability = await manager.adb_availability()
+    document["adb"] = {
+        "available": bool(availability.available),
+        "reason": availability.reason,
+        "serial": availability.serial,
+    }
+    return web.json_response(document)
+
+
+async def _upload_media(request: web.Request) -> web.Response:
+    manager = _media_manager(request)
+    # The name is metadata only. MediaJob never uses it for a local/remote path
+    # or subprocess argument and generates its own destination basename.
+    original_name = request.headers.get("X-Filename", "upload")
+    result = await manager.upload(request.content, original_name)
+    return web.json_response(result.to_dict(), status=201 if result.confirmed else 502)
+
+
+async def _get_media_job(request: web.Request) -> web.Response:
+    manager = _media_manager(request)
+    job_id = request.match_info["job_id"]
+    result = manager.jobs.get(job_id)
+    if result is None:
+        raise FileNotFoundError(job_id)
+    return web.json_response(result.to_dict())
+
+
+async def _delete_media(request: web.Request) -> web.Response:
+    manager = _media_manager(request)
+    result = await manager.delete(request.match_info["name"])
+    return web.json_response(result.to_dict(), status=200 if result.confirmed else 502)
 
 
 async def _patch_brightness(request: web.Request) -> web.Response:
@@ -639,6 +701,10 @@ def create_app(context: AppContext) -> web.Application:
     app.router.add_get(API_PREFIX + "/sensors", _get_sensors)
     app.router.add_get(API_PREFIX + "/device", _get_device)
     app.router.add_get(API_PREFIX + "/events", _events)
+    app.router.add_get(API_PREFIX + "/media", _get_media)
+    app.router.add_post(API_PREFIX + "/media/upload", _upload_media)
+    app.router.add_get(API_PREFIX + "/media/jobs/{job_id}", _get_media_job)
+    app.router.add_delete(API_PREFIX + "/media/{name}", _delete_media)
     app.router.add_patch(API_PREFIX + "/brightness", _patch_brightness)
     app.router.add_patch(API_PREFIX + "/screen", _patch_screen)
     app.router.add_patch(API_PREFIX + "/telemetry-settings", _patch_telemetry_settings)

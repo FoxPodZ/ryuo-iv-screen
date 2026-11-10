@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+import json
+from pathlib import Path
+
+import pytest
+
+from ryuo_screen.media import MediaCatalog, MediaTools, ToolUnavailable
+
+
+class Result:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def _probe(codec="hevc", pix_fmt="yuv420p", width=2240, height=1080, fmt="mov,mp4", name="clip.mp4"):
+    return json.dumps({
+        "format": {"filename": name, "format_name": fmt, "duration": "2.5", "size": "1200"},
+        "streams": [{"codec_type": "video", "codec_name": codec, "pix_fmt": pix_fmt,
+                     "width": width, "height": height}],
+    })
+
+
+def test_catalog_classification_comes_exactly_from_conn_lists():
+    catalog = MediaCatalog.from_conn({"media": {
+        "preset": ["rYuO_MIKU.mp4", "Factory.PNG"],
+        "custom": ["RYUO-user.mp4", "mine.png"],
+    }})
+    assert catalog.factory == ("rYuO_MIKU.mp4", "Factory.PNG")
+    assert catalog.custom == ("RYUO-user.mp4", "mine.png")
+    assert catalog.classify("rYuO_MIKU.mp4") == "factory"
+    assert catalog.classify("RYUO-user.mp4") == "custom"
+    assert catalog.classify("ryuo_miku.mp4") is None
+
+
+def test_probe_and_conversion_plans_cover_video_and_stills(tmp_path):
+    outputs = iter([
+        _probe(),
+        _probe(codec="h264"),
+        _probe(codec="hevc", width=3000),
+        _probe(codec="png", pix_fmt="rgba", fmt="image2", name="x.png"),
+        _probe(codec="mjpeg", pix_fmt="yuvj420p", fmt="image2", name="x.jpg"),
+        _probe(codec="gif", pix_fmt="bgra", fmt="gif", name="x.gif"),
+        _probe(codec="hevc", pix_fmt="yuv420p", fmt="matroska", name="x.mkv"),
+        _probe(codec="webp", pix_fmt="yuv420p", fmt="image2", name="x.webp"),
+    ])
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Result(next(outputs))
+
+    tools = MediaTools(runner=run, which=lambda name: "/usr/bin/" + name)
+    files = [tmp_path / name for name in (
+        "ok.mp4", "h264.mp4", "wide.mp4", "x.png", "x.jpg", "x.gif",
+        "x.mkv", "x.webp",
+    )]
+    infos = [tools.probe(path) for path in files]
+    plans = [tools.plan(info) for info in infos[:6]]
+    assert plans[0].action == "passthrough"
+    assert plans[1].action == plans[2].action == plans[5].action == "transcode-video"
+    assert plans[3].action == "passthrough"
+    assert plans[4].action == "convert-still"
+    with pytest.raises(ValueError, match="unsupported media format"):
+        tools.plan(infos[6])
+    with pytest.raises(ValueError, match="unsupported media format"):
+        tools.plan(infos[7])
+    assert all(isinstance(call[0], list) and "shell" not in call[1] for call in calls)
+
+
+def test_thumbnail_proxy_are_bounded_and_missing_tools_are_explicit(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        Path(argv[-1]).touch()
+        return Result()
+
+    tools = MediaTools(runner=run, which=lambda name: "/bin/" + name)
+    tools.thumbnail(tmp_path / "in.mp4", tmp_path / "thumb.jpg", width=320, height=180)
+    tools.proxy(tmp_path / "in.mp4", tmp_path / "proxy.mp4", width=960, height=540)
+    assert "scale=320:180" in calls[0][0]
+    assert "scale=960:540" in calls[1][0]
+    assert "-fs" in calls[0][0]
+    assert "-fs" in calls[1][0] and "-t" in calls[1][0]
+    with pytest.raises(ValueError):
+        tools.thumbnail(tmp_path / "in", tmp_path / "out", width=641, height=180)
+    missing = MediaTools(which=lambda name: None)
+    assert missing.status() == {"ffprobe": False, "ffmpeg": False}
+    with pytest.raises(ToolUnavailable):
+        missing.probe(tmp_path / "in.mp4")
