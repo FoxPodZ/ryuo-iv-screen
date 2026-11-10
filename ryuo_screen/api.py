@@ -139,6 +139,7 @@ class AppContext:
             raise ValueError("SSE heartbeat must be positive")
         self.state = self.state_store.load()
         self.mutation_lock = asyncio.Lock()
+        self._live_task = None
         if self.sse is None:
             self.sse = SseHub(self.snapshot_document())
 
@@ -163,6 +164,41 @@ class AppContext:
     def publish_snapshot(self) -> int:
         assert self.sse is not None
         return self.sse.publish(self.snapshot_document())
+
+    @property
+    def live_publisher_running(self) -> bool:
+        return self._live_task is not None and not self._live_task.done()
+
+    async def start_live_publisher(self) -> None:
+        if self.live_publisher_running:
+            return
+        self._live_task = asyncio.create_task(
+            self._live_publisher(), name="ryuo-live-telemetry"
+        )
+
+    async def stop_live_publisher(self) -> None:
+        task = self._live_task
+        if task is None:
+            return
+        self._live_task = None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _live_publisher(self) -> None:
+        while True:
+            # State mutations replace the immutable ScreenState, so the next
+            # iteration automatically adopts the current telemetry cadence.
+            await asyncio.sleep(float(self.state.refresh_interval))
+            try:
+                self.publish_snapshot()
+            except Exception:
+                # A transient collector/status error must not terminate live
+                # delivery. snapshot_document already records telemetry
+                # errors; this guard also isolates an unexpected status source.
+                continue
 
 
 # AppKey avoids accidental collisions on current aiohttp while the string
@@ -539,8 +575,10 @@ async def _events(request: web.Request) -> web.StreamResponse:
             "X-Accel-Buffering": "no",
         },
     )
-    await response.prepare(request)
+    prepared = False
     try:
+        await response.prepare(request)
+        prepared = True
         while True:
             try:
                 event = await asyncio.wait_for(subscriber.get(), context.sse_heartbeat)
@@ -550,11 +588,23 @@ async def _events(request: web.Request) -> web.StreamResponse:
             payload = json.dumps(event.snapshot, ensure_ascii=False, separators=(",", ":"))
             data = "id: {}\nevent: snapshot\ndata: {}\n\n".format(event.event_id, payload)
             await response.write(data.encode("utf-8"))
-    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
-        pass
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionResetError, BrokenPipeError):
+        if not prepared:
+            raise
     finally:
         subscriber.close()
     return response
+
+
+async def _live_events_context(app: web.Application):
+    context: AppContext = app[CONTEXT_KEY]
+    await context.start_live_publisher()
+    try:
+        yield
+    finally:
+        await context.stop_live_publisher()
 
 
 def create_app(context: AppContext) -> web.Application:
@@ -562,6 +612,7 @@ def create_app(context: AppContext) -> web.Application:
         raise TypeError("context must be AppContext")
     app = web.Application(middlewares=[_errors])
     app[CONTEXT_KEY] = context
+    app.cleanup_ctx.append(_live_events_context)
     app.router.add_get(API_PREFIX + "/state", _get_state)
     app.router.add_get(API_PREFIX + "/telemetry", _get_telemetry)
     app.router.add_get(API_PREFIX + "/sensors", _get_sensors)

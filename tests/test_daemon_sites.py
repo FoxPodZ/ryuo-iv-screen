@@ -72,3 +72,21 @@ async def test_foreign_owned_socket_is_not_removed(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         await run_sites(_app(), tcp=None, uds=socket_path)
     assert socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_second_instance_refuses_active_owned_socket_and_first_keeps_serving(tmp_path):
+    socket_path = tmp_path / "control.sock"
+    first = await run_sites(_app(), tcp=None, uds=socket_path)
+    first_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
+    try:
+        with pytest.raises(FileExistsError, match="active"):
+            await run_sites(_app(), tcp=None, uds=socket_path)
+        assert (socket_path.stat().st_dev, socket_path.stat().st_ino) == first_identity
+        connector = aiohttp.UnixConnector(path=str(socket_path))
+        async with aiohttp.ClientSession(connector=connector) as session:
+            response = await session.get("http://localhost/api/v1/state")
+            assert response.status == 200
+            assert (await response.json())["revision"] == 7
+    finally:
+        await first.stop()

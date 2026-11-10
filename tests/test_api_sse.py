@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import asyncio
 
+import aiohttp
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, SseHub, create_app
@@ -89,5 +91,80 @@ async def test_sse_endpoint_emits_snapshot_heartbeat_and_cleans_disconnect(tmp_p
         line = await asyncio.wait_for(heartbeat.content.readline(), 0.5)
         assert line.startswith(b": heartbeat")
         heartbeat.close()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_app_lifecycle_publishes_live_telemetry_without_mutations_and_stops(tmp_path):
+    class ChangingTelemetry(_Telemetry):
+        def __init__(self):
+            self.samples = 0
+
+        def sample(self):
+            self.samples += 1
+            return TelemetrySnapshot({}, float(self.samples))
+
+    telemetry = ChangingTelemetry()
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.save(ScreenState(refresh_interval=0.02))
+    context = AppContext(
+        state_store,
+        ProfileStore(tmp_path / "profiles"),
+        _Device(),
+        telemetry,
+    )
+    client = TestClient(TestServer(create_app(context)))
+    await client.start_server()
+    try:
+        initial_id = context.sse.last_event_id
+        for _ in range(100):
+            if context.sse.last_event_id >= initial_id + 3:
+                break
+            await asyncio.sleep(0.01)
+        assert context.sse.last_event_id >= initial_id + 3
+        assert telemetry.samples >= 4  # initial snapshot plus periodic updates
+        assert context.live_publisher_running
+    finally:
+        await client.close()
+    stopped_id = context.sse.last_event_id
+    assert not context.live_publisher_running
+    await asyncio.sleep(0.05)
+    assert context.sse.last_event_id == stopped_id
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_does_not_leak_sse_subscriber(tmp_path, monkeypatch):
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.save(ScreenState())
+    context = AppContext(
+        state_store,
+        ProfileStore(tmp_path / "profiles"),
+        _Device(),
+        _Telemetry(),
+    )
+    original_prepare = web.StreamResponse.prepare
+
+    async def fail_event_stream_prepare(response, request):
+        if response.headers.get("Content-Type") == "text/event-stream":
+            raise ConnectionResetError("client left before headers")
+        return await original_prepare(response, request)
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", fail_event_stream_prepare)
+    client = TestClient(TestServer(create_app(context)))
+    await client.start_server()
+    try:
+        try:
+            response = await client.get("/api/v1/events")
+        except (aiohttp.ClientError, ConnectionResetError):
+            pass
+        else:
+            assert response.status >= 500
+            await response.read()
+        for _ in range(50):
+            if context.sse.subscriber_count == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert context.sse.subscriber_count == 0
     finally:
         await client.close()

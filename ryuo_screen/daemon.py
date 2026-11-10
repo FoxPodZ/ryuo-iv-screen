@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,30 @@ def _prepare_socket(path: Path) -> None:
         raise FileExistsError("refusing to replace non-socket path {}".format(path))
     if metadata.st_uid != os.geteuid():
         raise PermissionError("refusing to replace socket owned by another user")
+    identity = (metadata.st_dev, metadata.st_ino)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.1)
+    try:
+        probe.connect(str(path))
+    except OSError as exc:
+        if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+            raise FileExistsError(
+                "refusing to replace Unix socket with unknown listener state"
+            ) from exc
+    else:
+        raise FileExistsError("refusing to replace active Unix socket {}".format(path))
+    finally:
+        probe.close()
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        (current.st_dev, current.st_ino) != identity
+        or not stat.S_ISSOCK(current.st_mode)
+        or current.st_uid != os.geteuid()
+    ):
+        raise FileExistsError("Unix socket changed while checking stale state")
     path.unlink()
 
 
