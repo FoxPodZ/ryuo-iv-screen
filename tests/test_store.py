@@ -93,6 +93,22 @@ def test_app_config_missing_file_uses_documented_paths(tmp_path):
     assert loaded.listen_host == "127.0.0.1"
 
 
+@pytest.mark.parametrize(
+    "document, field",
+    [
+        ('lan_enabled = "false"\n', "lan_enabled"),
+        ("[security]\npassword_verifier = 123\n", "password_verifier"),
+        ('[security]\ntrusted_proxy = ["127.0.0.1"]\n', "trusted_proxy"),
+    ],
+)
+def test_app_config_rejects_wrong_security_field_types(tmp_path, document, field):
+    path = tmp_path / "config.toml"
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(TypeError, match=field):
+        AppConfig.load(path)
+
+
 def test_state_restart_round_trip_and_permissions(tmp_path):
     path = tmp_path / "state.json"
     store = StateStore(path)

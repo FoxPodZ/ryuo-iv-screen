@@ -2,6 +2,7 @@
 """Named profile CRUD, validation and import/export tests."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -147,6 +148,38 @@ def test_factory_profile_cannot_be_deleted(tmp_path):
 
     with pytest.raises(PermissionError, match="factory"):
         store.delete(factory.slug)
+
+
+def test_factory_profile_cannot_be_demoted_then_deleted(tmp_path):
+    store = ProfileStore(tmp_path / "profiles")
+    factory = default_miku_profiles()[0]
+    store.create(factory)
+
+    with pytest.raises(PermissionError, match="factory"):
+        store.update(factory.slug, replace(factory, factory=False))
+    with pytest.raises(PermissionError, match="factory"):
+        store.delete(factory.slug)
+
+    assert store.get(factory.slug) == factory
+
+
+def test_factory_profile_media_and_identity_cannot_be_mutated(tmp_path):
+    store = ProfileStore(tmp_path / "profiles")
+    factory = default_miku_profiles()[0]
+    store.create(factory)
+    changed = replace(
+        factory,
+        slug="changed-factory",
+        name="Changed Factory",
+        media=(("renamed.mp4",),),
+    )
+
+    with pytest.raises(PermissionError, match="factory"):
+        store.update(factory.slug, changed)
+
+    assert store.get(factory.slug) == factory
+    with pytest.raises(ProfileNotFound):
+        store.get(changed.slug)
 
 
 def test_default_miku_profiles_pin_exact_factory_media_order():

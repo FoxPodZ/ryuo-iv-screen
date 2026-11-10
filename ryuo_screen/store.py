@@ -148,6 +148,12 @@ class AppConfig:
             self.motherboard_sensor, SensorRef
         ):
             raise TypeError("motherboard_sensor must be a SensorRef")
+        if not isinstance(self.lan_enabled, bool):
+            raise TypeError("lan_enabled must be a boolean")
+        if self.password_verifier is not None:
+            _string("password_verifier", self.password_verifier)
+        if self.trusted_proxy is not None:
+            _string("trusted_proxy", self.trusted_proxy)
 
     @property
     def state_path(self) -> Path:
@@ -567,8 +573,9 @@ class ProfileStore:
 
     def update(self, slug: str, profile: Profile) -> Profile:
         old_path = self._path(slug)
-        if not old_path.is_file():
-            raise ProfileNotFound(slug)
+        current = self.get(slug)
+        if current.factory:
+            raise PermissionError("factory profiles cannot be updated")
         profile = Profile.from_dict(profile.to_dict() if isinstance(profile, Profile) else profile)
         new_path = self._path(profile.slug)
         if new_path == old_path:
