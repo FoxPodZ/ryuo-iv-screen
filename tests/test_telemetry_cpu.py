@@ -94,13 +94,51 @@ def test_cpu_power_prefers_average_then_input_without_losing_temperature(cpu):
     assert not sample["cpu.power"].available and sample["cpu.power"].error
 
 
-def test_coretemp_prefers_package_over_other_temperatures(cpu):
+@pytest.mark.parametrize("package_label", ["Package id 0", "Physical id 0"])
+def test_coretemp_prefers_package_over_other_temperatures(cpu, package_label):
     fake, _, provider = cpu
     fake.hwmon(fake.root / "devices/platform/coretemp.0", 3, "coretemp", {
-        "temp1": (38000, "Core 0"), "temp2": (47000, "Package id 0"),
+        "temp1": (38000, "Core 0"), "temp2": (47000, package_label),
     })
     sample = provider.sample().measurements
     assert sample["cpu.temperature"].value == sample["cpu.temperature.package"].value == 47
+
+
+def test_coretemp_keeps_core_temperature_when_package_sensor_disappears(cpu):
+    fake, _, provider = cpu
+    chip = fake.hwmon(fake.root / "devices/platform/coretemp.0", 3, "coretemp", {
+        "temp1": (38000, "Core 0"), "temp2": (47000, "Package id 0"),
+    })
+    assert provider.sample().measurements["cpu.temperature.package"].value == 47
+    (chip / "temp2_input").unlink()
+
+    sample = provider.sample().measurements
+    assert sample["cpu.temperature"].value == 38
+    package = sample["cpu.temperature.package"]
+    assert not package.available and package.value is None and package.error
+
+
+def test_unlabeled_acpitz_is_not_a_cpu_or_package_temperature(cpu):
+    fake, _, provider = cpu
+    fake.hwmon(fake.root / "devices/virtual/thermal/thermal_zone0", 3, "acpitz", {
+        "temp1": (29000, None),
+    })
+
+    sample = provider.sample().measurements
+    for key in ("cpu.temperature", "cpu.temperature.package"):
+        reading = sample[key]
+        assert not reading.available and reading.value is None and reading.error
+
+
+def test_cpu_labeled_acpitz_can_only_supply_general_cpu_temperature(cpu):
+    fake, _, provider = cpu
+    fake.hwmon(fake.root / "devices/virtual/thermal/thermal_zone0", 3, "acpitz", {
+        "temp1": (29000, None), "temp2": (43000, "CPU"),
+    })
+
+    sample = provider.sample().measurements
+    assert sample["cpu.temperature"].value == 43
+    assert not sample["cpu.temperature.package"].available
 
 
 def test_cpu_package_power_uses_energy_delta_and_handles_counter_wrap(cpu):

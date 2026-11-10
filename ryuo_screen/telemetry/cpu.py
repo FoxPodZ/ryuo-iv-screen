@@ -159,18 +159,29 @@ class CpuProvider:
     def _temperature(self, chips: Sequence[HwmonChip], package: bool) -> _Reading:
         amd_labels = ("tctl", "tdie") if package else ("tdie", "tctl")
 
-        def rank(label: str) -> int:
-            if label in amd_labels:
+        def rank(chip_name: str, label: str) -> Optional[int]:
+            if chip_name in ("k10temp", "zenpower") and label in amd_labels:
                 return amd_labels.index(label)
-            return 0 if label.startswith("package") else 2
+            if chip_name == "coretemp":
+                if re.fullmatch(r"package(?: id [0-9]+)?|physical id [0-9]+", label):
+                    return 0
+                if not package and re.fullmatch(r"core [0-9]+", label):
+                    return 1
+            if chip_name == "acpitz" and not package and label in ("cpu", "cpu temperature"):
+                return 0
+            return None
 
-        last = _Reading(error="No CPU temperature channels")
+        sensor = "CPU package" if package else "CPU"
+        last = _Reading(error="No confirmed {} temperature channels".format(sensor))
         for chip in chips:
-            candidates = sorted(
-                (channel for channel in chip.channels if channel.kind == "temp"),
-                key=lambda channel: rank((channel.label or "").strip().casefold()),
-            )
-            for channel in candidates:
+            candidates = []
+            for channel in chip.channels:
+                if channel.kind != "temp":
+                    continue
+                priority = rank(chip.name, (channel.label or "").strip().casefold())
+                if priority is not None:
+                    candidates.append((priority, channel))
+            for _, channel in sorted(candidates, key=lambda candidate: candidate[0]):
                 result = self._sysfs.read_number(channel.input_path, 1e-3)
                 last = _Reading(result.value, self._sysfs.root / channel.input_path, result.error)
                 if last.value is not None:
