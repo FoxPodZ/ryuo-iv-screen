@@ -13,6 +13,8 @@ from typing import Optional, Tuple, Union
 
 from aiohttp import web
 
+from .auth import SECURITY_KEY, SecurityPolicy
+
 
 DEFAULT_TCP = ("127.0.0.1", 8746)
 DEFAULT_UDS = Path("/run/ryuo-screen/control.sock")
@@ -88,12 +90,28 @@ async def run_sites(
     app: web.Application,
     tcp: Optional[Tuple[str, int]] = DEFAULT_TCP,
     uds: Optional[Union[str, Path]] = DEFAULT_UDS,
+    security: Optional[SecurityPolicy] = None,
 ) -> RunningSites:
     """Start one aiohttp application on TCP and/or a protected Unix socket."""
     if not isinstance(app, web.Application):
         raise TypeError("app must be an aiohttp Application")
     if tcp is None and uds is None:
         raise ValueError("at least one API site is required")
+    app_policy = app.get(SECURITY_KEY)
+    if security is not None and app_policy is not None and security is not app_policy:
+        raise ValueError("security must match the application security policy")
+    policy = app_policy if app_policy is not None else security
+    if tcp is not None:
+        host, _port = tcp
+        if not host in ("localhost", "127.0.0.1", "::1") and app_policy is None:
+            raise ValueError("LAN application requires installed security middleware")
+        if policy is None:
+            if host not in ("localhost", "127.0.0.1", "::1"):
+                raise ValueError("LAN bind requires an explicit security policy")
+        else:
+            if not isinstance(policy, SecurityPolicy):
+                raise TypeError("security must be a SecurityPolicy")
+            policy.validate_bind(host)
     socket_path = Path(uds) if uds is not None else None
     if socket_path is not None:
         socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)

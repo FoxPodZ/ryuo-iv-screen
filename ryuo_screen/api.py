@@ -11,10 +11,19 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from aiohttp import web
 
+from .auth import (
+    SECURITY_KEY,
+    SecurityPolicy,
+    auth_login,
+    auth_logout,
+    auth_status,
+    security_middleware,
+)
 from .device import DeviceCommand, LatestTelemetry
 from .media import MediaBusy, MediaManager, MediaOperationError, ToolUnavailable
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
 from .store import (
+    AppConfig,
     Profile,
     ProfileConflict,
     ProfileNotFound,
@@ -135,6 +144,7 @@ class AppContext:
     sse: Optional[SseHub] = None
     sse_heartbeat: float = 15.0
     media: Optional[MediaManager] = None
+    security: Optional[SecurityPolicy] = None
 
     def __post_init__(self) -> None:
         if self.sse_heartbeat <= 0:
@@ -142,6 +152,8 @@ class AppContext:
         self.state = self.state_store.load()
         self.mutation_lock = asyncio.Lock()
         self._live_task = None
+        if self.security is None:
+            self.security = SecurityPolicy.from_config(AppConfig())
         if self.sse is None:
             self.sse = SseHub(self.snapshot_document())
 
@@ -712,9 +724,14 @@ async def _live_events_context(app: web.Application):
 def create_app(context: AppContext) -> web.Application:
     if not isinstance(context, AppContext):
         raise TypeError("context must be AppContext")
-    app = web.Application(middlewares=[_errors])
+    app = web.Application(middlewares=[security_middleware, _errors])
     app[CONTEXT_KEY] = context
+    assert context.security is not None
+    app[SECURITY_KEY] = context.security
     app.cleanup_ctx.append(_live_events_context)
+    app.router.add_get(API_PREFIX + "/auth/status", auth_status)
+    app.router.add_post(API_PREFIX + "/auth/login", auth_login)
+    app.router.add_post(API_PREFIX + "/auth/logout", auth_logout)
     app.router.add_get(API_PREFIX + "/state", _get_state)
     app.router.add_get(API_PREFIX + "/telemetry", _get_telemetry)
     app.router.add_get(API_PREFIX + "/sensors", _get_sensors)
