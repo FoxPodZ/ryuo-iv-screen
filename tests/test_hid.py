@@ -54,6 +54,17 @@ def test_write_frame_refuses_anything_but_one_report():
         ryuo_hid.write_frame(FakeHandle(), b"\x5a\x5a")
 
 
+def test_write_frame_rejects_a_partial_hid_write():
+    class PartialHandle(FakeHandle):
+        def write(self, data):
+            return len(data) - 1
+
+    with pytest.raises(OSError, match="wrote"):
+        ryuo_hid.write_frame(
+            PartialHandle(), proto.request(proto.GET, proto.RES_SPEC, seq=1)
+        )
+
+
 def test_skips_replies_to_other_requests():
     """A backlog from earlier requests, then ours. Must return ours."""
     h = FakeHandle(report(4), report(5), report(50001), report(8))
@@ -110,3 +121,9 @@ def test_drain_reads_everything_waiting_without_blocking():
     assert ryuo_hid.drain(h, seen.append) == 3
     assert [proto.reply_ack(b) for b in seen] == [2, 3, 4]
     assert ryuo_hid.drain(h) == 0                 # nothing left, returns at once
+
+
+def test_drain_has_a_report_budget_so_keepalive_cannot_be_starved():
+    h = FakeHandle(*(report(index) for index in range(2, 7)))
+    assert ryuo_hid.drain(h, max_reports=2) == 2
+    assert len(h.inbox) == 3

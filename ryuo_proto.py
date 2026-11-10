@@ -382,11 +382,28 @@ def media_delete_payload(*, include: list[str] | None = None,
 
 
 def redact_conn(info: dict) -> dict:
-    """A copy of a `conn` reply with the serial number blanked, for pasting."""
-    out = dict(info)
-    if "sn" in out:
-        out["sn"] = "<redacted>"
-    return out
+    """A serial-safe copy of a ``conn`` descriptor.
+
+    Firmware releases have used both ``sn`` and longer serial-number keys,
+    including inside capability objects.  Redact recursively so status/API
+    callers cannot accidentally expose one of the less common spellings.
+    """
+    serial_keys = {"sn", "serial", "serialnumber", "serial_number"}
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {
+                key: ("<redacted>" if str(key).lower() in serial_keys
+                      else redact(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    if not isinstance(info, dict):
+        raise TypeError("conn descriptor must be an object")
+    return redact(info)
 
 
 # ---------------------------------------------------------------- payloads
@@ -682,6 +699,58 @@ def config_payload(*, unit="Celsius", enable=True, display_in_sleep=True,
         },
         "spec": {"cpu": cpu_name, "gpu": gpu_name},
     }
+
+
+def screen_config_from_state(state, *, time_zone=None) -> dict:
+    """Build the protocol screen object from a validated ``ScreenState``.
+
+    This intentionally uses a small duck-typed boundary instead of importing
+    the persistence module into the protocol codec.
+    """
+    slots = [slot.widget if slot.enabled else "" for slot in state.slots]
+    media2 = list(state.media[1]) if len(state.media) == 2 else None
+    play_mode2 = state.playback_modes[1] if len(state.playback_modes) == 2 else None
+    return screen_config(
+        screen_mode=state.screen_mode,
+        media=list(state.media[0]),
+        media2=media2,
+        play_mode=state.playback_modes[0],
+        play_mode2=play_mode2,
+        sysinfo=slots,
+        title_color=state.title_colors[0],
+        content_color=state.content_colors[0],
+        title_color2=(state.title_colors[1] if len(state.title_colors) == 2 else None),
+        content_color2=(state.content_colors[1] if len(state.content_colors) == 2 else None),
+        opacity=state.opacity,
+        time_zone=time_zone,
+    )
+
+
+def config_payload_from_state(state, *, cpu_name="", gpu_name="", time_zone=None) -> dict:
+    """Build a full, validated-session payload from ``ScreenState``."""
+    return config_payload(
+        unit=state.temperature_unit,
+        brightness=state.brightness,
+        cpu_name=cpu_name,
+        gpu_name=gpu_name,
+        config=screen_config_from_state(state, time_zone=time_zone),
+    )
+
+
+def preset_payload_from_state(state) -> dict:
+    """Build the non-restarting visual update for one or two zones."""
+    slots = [slot.widget if slot.enabled else "" for slot in state.slots]
+    payload = preset_payload(
+        slots,
+        title_color=state.title_colors[0],
+        content_color=state.content_colors[0],
+        opacity=state.opacity,
+    )
+    if len(state.title_colors) == 2:
+        # Split mode uses the same two-element settings shape as config while
+        # sysinfoDisplay stays a flat six-slot array.
+        payload["settings"] = screen_config_from_state(state)["settings"]
+    return payload
 
 
 if __name__ == "__main__":

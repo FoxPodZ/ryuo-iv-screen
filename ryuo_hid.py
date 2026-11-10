@@ -53,8 +53,11 @@ def write_frame(h, frame: bytes) -> None:
     if len(frame) != proto.REPORT_SIZE:
         raise ValueError(f"expected one {proto.REPORT_SIZE}-byte report from "
                          f"proto.request(), got {len(frame)} bytes")
-    if h.write(b"\x00" + frame) < 0:
-        raise OSError("HID write failed")
+    report = b"\x00" + frame
+    written = h.write(report)
+    if written != len(report):
+        raise OSError("HID write failed: wrote {} of {} bytes".format(
+            written, len(report)))
 
 
 def read_reply(h, seq: int, timeout: float, log=None) -> str | None:
@@ -98,25 +101,31 @@ def read_reply(h, seq: int, timeout: float, log=None) -> str | None:
             time.sleep(0.01)
 
 
-def drain(h, log=None) -> int:
+def drain(h, log=None, max_reports: int = 64) -> int:
     """Read and decode whatever replies are already waiting, without blocking.
 
     For a loop that sends on a fixed clock and doesn't need its replies:
     waiting for one would stall the loop for as long as the device's reply
-    queue is deep. Returns how many replies were read; `log(body)` is called
-    for each. A long reply whose second report hasn't arrived yet is cut in
-    half here -- the next drain() or read_reply() resyncs past the tail.
+    queue is deep. At most ``max_reports`` are consumed per call, so a broken
+    or hostile producer cannot starve the fixed send clock. Returns how many
+    replies were decoded; `log(body)` is called for each. A long reply whose
+    second report hasn't arrived yet is cut in half here -- the next drain()
+    or read_reply() resyncs past the tail.
     """
-    buf, n = bytearray(), 0
-    while True:
+    if max_reports < 1:
+        raise ValueError("max_reports must be positive")
+    buf, n, reports = bytearray(), 0, 0
+    while reports < max_reports:
         data = h.read(proto.REPORT_SIZE)
         if not data:
             return n
+        reports += 1
         buf += bytes(data)
         while (body := proto.pop_reply(buf)) is not None:
             n += 1
             if log:
                 log(body)
+    return n
 
 
 def transact(h, method: str, resource: str, payload=None, *, seq: int,
