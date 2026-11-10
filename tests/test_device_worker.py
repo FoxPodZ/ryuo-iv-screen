@@ -164,3 +164,42 @@ def test_keepalive_uses_last_safe_payload_when_collection_fails_and_waiter_is_sl
     all_payloads = [call[4] for call in transport.calls if call[3] == proto.RES_ALL]
     assert len(all_payloads) >= 4
     assert all(payload == safe for payload in all_payloads)
+
+
+def test_sequence_growth_cannot_turn_accepted_command_into_unfinished_ticket():
+    transport = FakeTransport()
+    worker = DeviceWorker(
+        transport,
+        telemetry=lambda: proto.pc_info(),
+        state=ScreenState(),
+        keepalive_interval=10,
+        settle_seconds=0,
+        max_rate=200,
+    )
+    payload = None
+    for size in range(800, 1000):
+        candidate = {"pad": "x" * size}
+        try:
+            proto.request(proto.POST, "borderline", candidate, seq=1)
+        except ValueError:
+            continue
+        try:
+            proto.request(proto.POST, "borderline", candidate, seq=10)
+        except ValueError:
+            payload = candidate
+            break
+    assert payload is not None, "test must find the one-digit/two-digit frame boundary"
+
+    worker.start()
+    try:
+        _wait(lambda: worker.status().connected)
+        with worker._condition:
+            worker._sequence = 10
+        ticket = worker.submit(DeviceCommand(proto.POST, "borderline", payload))
+        result = ticket.wait(1)
+        assert ticket.done
+        assert result.applied is False
+        assert result.error and "1024-byte report" in result.error
+    finally:
+        worker.stop()
+    assert not any(call[3] == "borderline" for call in transport.calls)

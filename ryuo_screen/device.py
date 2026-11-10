@@ -21,6 +21,7 @@ PRIORITY_KEEPALIVE = 10
 PRIORITY_STATE = 30
 PRIORITY_UI = 50
 PRIORITY_ANIMATION = 100
+MAX_SEQUENCE = 2_147_483_647
 
 
 def _boottime() -> float:
@@ -173,7 +174,7 @@ def plan_state_change(old: ScreenState, new: ScreenState) -> ApplyPlan:
     full_fields = ("screen_mode", "media", "playback_modes")
     if any(getattr(old, name) != getattr(new, name) for name in full_fields):
         command = DeviceCommand.for_state(new)
-        command.validated(seq=1)
+        command.validated(seq=MAX_SEQUENCE)
         return ApplyPlan((command,), full_config=True, requires_settle=True)
 
     commands: List[DeviceCommand] = []
@@ -194,7 +195,7 @@ def plan_state_change(old: ScreenState, new: ScreenState) -> ApplyPlan:
             priority=PRIORITY_STATE, coalesce_key="preset", saved=True,
         ))
     for command in commands:
-        command.validated(seq=1)
+        command.validated(seq=MAX_SEQUENCE)
     return ApplyPlan(tuple(commands), full_config=False)
 
 
@@ -316,6 +317,7 @@ class DeviceWorker:
         self._last_safe = proto.pc_info(timestamp_ms=0)
         self._next_keepalive: Optional[float] = None
         self._last_loop_clock: Optional[float] = None
+        self._session_active = False
 
     def start(self) -> None:
         with self._condition:
@@ -353,7 +355,7 @@ class DeviceWorker:
             raise TypeError("command must be a DeviceCommand")
         ticket = CommandTicket(saved=command.saved)
         try:
-            command.validated(seq=1)
+            command.validated(seq=MAX_SEQUENCE)
         except (TypeError, ValueError) as exc:
             ticket._complete(CommandResult(
                 saved=command.saved, queued=False, error=str(exc)
@@ -419,12 +421,16 @@ class DeviceWorker:
                     try:
                         self._connect()
                     except Exception as exc:
+                        if self._should_stop():
+                            break
                         self._mark_disconnected(exc)
                         delay = self._backoff[min(backoff_index, len(self._backoff) - 1)]
                         backoff_index += 1
-                        self._wait(delay)
+                        self._wait_backoff(delay)
                         continue
                     backoff_index = 0
+                    if self._should_stop():
+                        break
 
                 now = self._clock()
                 if (self._last_loop_clock is not None
@@ -461,12 +467,14 @@ class DeviceWorker:
                              else max(0.0, self._next_keepalive - now))
                     self._wait(min(delay, 0.25))
                 except OSError as exc:
+                    if self._should_stop():
+                        break
                     self._mark_disconnected(exc)
                 except Exception as exc:
                     with self._condition:
                         self._last_error = "worker: {}".format(exc)
         finally:
-            if self._connected:
+            if self._session_active:
                 try:
                     self._send(proto.POST, proto.RES_DISCONN, None, timeout=0.2,
                                bypass_rate=True)
@@ -478,6 +486,7 @@ class DeviceWorker:
                 pass
             with self._condition:
                 self._connected = False
+                self._session_active = False
                 self._phase = "stopped"
                 for queued in self._pending:
                     queued.ticket._complete(CommandResult(
@@ -494,6 +503,8 @@ class DeviceWorker:
         try:
             body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5,
                               bypass_rate=True)
+            with self._condition:
+                self._session_active = True
             descriptor = proto.reply_json(body)
             if not isinstance(descriptor, dict):
                 descriptor = {}
@@ -512,7 +523,7 @@ class DeviceWorker:
             proto.request(proto.POST, proto.RES_CONFIG, payload, seq=self._sequence)
             self._send(proto.POST, proto.RES_CONFIG, payload, timeout=0.5)
             if self._settle_seconds and self._sleep(self._settle_seconds):
-                raise OSError("worker stopped while configuring")
+                return
             telemetry_ok = self._send_keepalive()
             with self._condition:
                 self._connected = True
@@ -538,10 +549,9 @@ class DeviceWorker:
                 self._pending = remaining
                 self._condition.notify_all()
         except Exception:
-            try:
+            if not self._should_stop():
                 self._transport.close()
-            finally:
-                raise
+            raise
 
     @staticmethod
     def _descriptor_value(document: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -554,9 +564,9 @@ class DeviceWorker:
     def _process(self, queued: _Queued) -> None:
         command = queued.command
         if command.state is not None:
-            plan = plan_state_change(self._applied_state, command.state)
-            acked = True
             try:
+                plan = plan_state_change(self._applied_state, command.state)
+                acked = True
                 for planned in plan.commands:
                     body = self._send(
                         planned.method, planned.resource, planned.payload,
@@ -567,19 +577,16 @@ class DeviceWorker:
                     if self._settle_seconds and self._sleep(self._settle_seconds):
                         raise OSError("worker stopped while applying config")
                     self._send_keepalive()
+            except ValueError as exc:
+                queued.ticket._complete(CommandResult(
+                    saved=True, queued=True, applied=False, error=str(exc)
+                ))
+                with self._condition:
+                    self._last_error = "command: {}".format(exc)
+                return
             except OSError:
                 # Keep the latest state queued: reconnect's full config applies it.
-                with self._condition:
-                    newer = any(
-                        item.command.coalesce_key == command.coalesce_key
-                        for item in self._pending
-                    )
-                    if newer:
-                        queued.ticket._complete(CommandResult(
-                            saved=True, queued=True, error="superseded"
-                        ))
-                    else:
-                        self._pending.append(queued)
+                self._requeue_failed_state(queued)
                 raise
             self._applied_state = command.state
             queued.ticket._complete(CommandResult(
@@ -592,6 +599,13 @@ class DeviceWorker:
                 command.method, command.resource, command.payload,
                 timeout=0.3 if command.expect_reply else 0,
             )
+        except ValueError as exc:
+            queued.ticket._complete(CommandResult(
+                saved=command.saved, queued=True, applied=False, error=str(exc)
+            ))
+            with self._condition:
+                self._last_error = "command: {}".format(exc)
+            return
         except OSError as exc:
             queued.ticket._complete(CommandResult(
                 saved=command.saved, queued=True, applied=False, error=str(exc)
@@ -643,6 +657,8 @@ class DeviceWorker:
         *, timeout: float, bypass_rate: bool = False,
     ) -> Optional[str]:
         seq = self._sequence
+        if seq > MAX_SEQUENCE:
+            raise ValueError("device sequence counter exceeded supported range")
         proto.request(method, resource, dict(payload) if payload is not None else None, seq=seq)
         if not bypass_rate and self._last_send is not None:
             delay = self._min_send_gap - (self._clock() - self._last_send)
@@ -666,11 +682,39 @@ class DeviceWorker:
             pass
         with self._condition:
             self._connected = False
+            self._session_active = False
             self._phase = "disconnected"
             self._last_error = str(exc)
             self._had_failure = True
             self._next_keepalive = None
             self._last_loop_clock = None
+            self._condition.notify_all()
+
+    def _requeue_failed_state(self, queued: _Queued) -> None:
+        """Retain an accepted saved state without ever exceeding queue_size."""
+        with self._condition:
+            newer = any(
+                item.command.coalesce_key == queued.command.coalesce_key
+                for item in self._pending
+            )
+            if newer:
+                queued.ticket._complete(CommandResult(
+                    saved=True, queued=True, error="superseded"
+                ))
+                return
+            if len(self._pending) >= self._queue_size:
+                displaced = max(
+                    self._pending,
+                    key=lambda item: (item.command.priority, item.order),
+                )
+                self._pending.remove(displaced)
+                displaced.ticket._complete(CommandResult(
+                    saved=displaced.command.saved,
+                    queued=True,
+                    applied=False,
+                    error="evicted to retain saved state during recovery",
+                ))
+            self._pending.append(queued)
             self._condition.notify_all()
 
     def _peek(self) -> Optional[_Queued]:
@@ -691,7 +735,7 @@ class DeviceWorker:
             return self._stop
 
     def _wait(self, seconds: float) -> bool:
-        """Wakeable wait for idle/backoff; submissions may end it early."""
+        """Wakeable idle wait; submissions may end it early."""
         with self._condition:
             if self._stop:
                 return True
@@ -703,6 +747,20 @@ class DeviceWorker:
         deadline = time.monotonic() + max(0.0, seconds)
         with self._condition:
             while not self._stop:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def _wait_backoff(self, seconds: float) -> bool:
+        """Wait the full reconnect delay; only stop/resume may bypass it."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        with self._condition:
+            while not self._stop:
+                if self._resume_requested:
+                    self._resume_requested = False
+                    return False
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
