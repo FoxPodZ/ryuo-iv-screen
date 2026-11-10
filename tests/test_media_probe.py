@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from ryuo_screen.media import MediaCatalog, MediaTools, ToolUnavailable
+from ryuo_screen.media import MediaCatalog, MediaInfo, MediaTools, ToolUnavailable
 
 
 class Result:
@@ -62,6 +64,10 @@ def test_probe_and_conversion_plans_cover_video_and_stills(tmp_path):
     assert plans[1].action == plans[2].action == plans[5].action == "transcode-video"
     assert plans[3].action == "passthrough"
     assert plans[4].action == "convert-still"
+    embedded_png = MediaInfo(
+        "embedded.mp4", "mov,mp4", "png", "rgba", 2240, 1080, 1.0, 100,
+    )
+    assert tools.plan(embedded_png).action == "convert-still"
     with pytest.raises(ValueError, match="unsupported media format"):
         tools.plan(infos[6])
     with pytest.raises(ValueError, match="unsupported media format"):
@@ -90,3 +96,27 @@ def test_thumbnail_proxy_are_bounded_and_missing_tools_are_explicit(tmp_path):
     assert missing.status() == {"ffprobe": False, "ffmpeg": False}
     with pytest.raises(ToolUnavailable):
         missing.probe(tmp_path / "in.mp4")
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="real FFmpeg/FFprobe tools are not installed",
+)
+def test_real_ffmpeg_probe_convert_probe_round_trip(tmp_path):
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        shutil.which("ffmpeg"), "-nostdin", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=blue:s=64x64:r=1",
+        "-frames:v", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(source),
+    ], check=True, timeout=15)
+    tools = MediaTools(timeout=30)
+    before = tools.probe(source)
+    plan = tools.plan(before)
+    assert before.codec == "h264" and plan.action == "transcode-video"
+    output = tmp_path / "converted.mp4"
+    tools.convert(source, output, plan, 32 * 1024 * 1024)
+    after = tools.probe(output)
+    assert (after.codec, after.pixel_format, after.width, after.height) == (
+        "hevc", "yuv420p", 2240, 1080,
+    )

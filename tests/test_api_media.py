@@ -8,7 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, create_app
 from ryuo_screen.device import DeviceStatus, LatestTelemetry
-from ryuo_screen.media import MediaCatalog, MediaManager
+from ryuo_screen.media import MediaBusy, MediaCatalog, MediaManager
 from ryuo_screen.models import CommandResult, TelemetrySnapshot
 from ryuo_screen.store import ProfileStore, ScreenState, StateStore
 
@@ -58,6 +58,14 @@ class Tools:
         from ryuo_screen.media import ConversionPlan
         return ConversionPlan("passthrough", ".png")
 
+    def thumbnail(self, source, destination, **kwargs):
+        Path(destination).write_bytes(b"jpeg-preview")
+        return Path(destination)
+
+    def proxy(self, source, destination, **kwargs):
+        Path(destination).write_bytes(b"mp4-proxy")
+        return Path(destination)
+
 
 class Adb:
     def __init__(self, device, success=True, refresh=True):
@@ -72,6 +80,10 @@ class Adb:
         if self.success and self.refresh:
             self.device.custom.append(name)
         return self.success
+
+    def pull(self, name, destination, *, factory=False, max_bytes=None):
+        Path(destination).write_bytes(b"device-media")
+        return True
 
 
 async def _client(tmp_path, adb_success=True, refresh=True):
@@ -157,6 +169,34 @@ async def test_media_api_requires_configured_pipeline(tmp_path):
         await client.close()
     assert response.status == 503
     assert body["error"] == "media_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_media_preview_routes_and_busy_status_are_bounded(tmp_path):
+    client, context, device = await _client(tmp_path)
+    device.custom.append("mine.png")
+    try:
+        thumbnail = await client.get("/api/v1/media/preview/thumbnail/RyUO_MIKU.mp4")
+        thumbnail_body = await thumbnail.read()
+        proxy = await client.get("/api/v1/media/preview/proxy/mine.png")
+        proxy_body = await proxy.read()
+        missing = await client.get("/api/v1/media/preview/thumbnail/nope.png")
+
+        async def busy(stream, original_name):
+            raise MediaBusy("media job capacity is full")
+
+        context.media.upload = busy
+        rejected = await client.post("/api/v1/media/upload", data=b"x")
+        rejected_body = await rejected.json()
+    finally:
+        await client.close()
+    assert thumbnail.status == 200 and thumbnail_body == b"jpeg-preview"
+    assert thumbnail.content_type == "image/jpeg"
+    assert proxy.status == 200 and proxy_body == b"mp4-proxy"
+    assert proxy.content_type == "video/mp4"
+    assert missing.status == 404
+    assert rejected.status == 429
+    assert rejected_body["error"] == "media_busy"
 
 
 @pytest.mark.asyncio

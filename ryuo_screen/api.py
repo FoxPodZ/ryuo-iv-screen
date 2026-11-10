@@ -12,7 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from aiohttp import web
 
 from .device import DeviceCommand, LatestTelemetry
-from .media import MediaManager, ToolUnavailable
+from .media import MediaBusy, MediaManager, MediaOperationError, ToolUnavailable
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
 from .store import (
     Profile,
@@ -438,6 +438,14 @@ async def _errors(request: web.Request, handler):
         return web.json_response(
             {"error": "tool_unavailable", "message": str(exc)}, status=503
         )
+    except MediaBusy as exc:
+        return web.json_response(
+            {"error": "media_busy", "message": str(exc)}, status=429
+        )
+    except MediaOperationError as exc:
+        return web.json_response(
+            {"error": "media_operation_failed", "message": str(exc)}, status=502
+        )
     except ProfileConflict as exc:
         return web.json_response(
             {"error": "conflict", "message": str(exc)}, status=409
@@ -522,6 +530,17 @@ async def _get_media_job(request: web.Request) -> web.Response:
     if result is None:
         raise FileNotFoundError(job_id)
     return web.json_response(result.to_dict())
+
+
+async def _get_media_preview(request: web.Request) -> web.Response:
+    manager = _media_manager(request)
+    preview = await manager.preview(
+        request.match_info["name"], request.match_info["kind"]
+    )
+    return web.Response(
+        body=preview.data, content_type=preview.content_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def _delete_media(request: web.Request) -> web.Response:
@@ -704,6 +723,9 @@ def create_app(context: AppContext) -> web.Application:
     app.router.add_get(API_PREFIX + "/media", _get_media)
     app.router.add_post(API_PREFIX + "/media/upload", _upload_media)
     app.router.add_get(API_PREFIX + "/media/jobs/{job_id}", _get_media_job)
+    app.router.add_get(
+        API_PREFIX + "/media/preview/{kind}/{name}", _get_media_preview
+    )
     app.router.add_delete(API_PREFIX + "/media/{name}", _delete_media)
     app.router.add_patch(API_PREFIX + "/brightness", _patch_brightness)
     app.router.add_patch(API_PREFIX + "/screen", _patch_screen)

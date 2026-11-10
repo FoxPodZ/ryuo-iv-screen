@@ -14,7 +14,10 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
@@ -26,6 +29,7 @@ from .models import CommandResult
 
 
 REMOTE_MEDIA_DIR = "/sdcard/pcMedia"
+REMOTE_FACTORY_MEDIA_DIR = "/sdcard/pcMediaPreset"
 MAX_THUMBNAIL = (640, 360)
 MAX_PROXY = (1280, 720)
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
@@ -35,6 +39,14 @@ MAX_PROXY_SECONDS = 30
 
 class ToolUnavailable(RuntimeError):
     """A required external media tool is not installed."""
+
+
+class MediaBusy(RuntimeError):
+    """The bounded media worker capacity is already in use."""
+
+
+class MediaOperationError(RuntimeError):
+    """A bounded external media operation failed."""
 
 
 @dataclass(frozen=True)
@@ -180,7 +192,7 @@ class MediaTools:
         )
         if not (is_mp4 or is_gif or is_image):
             raise ValueError("unsupported media format; use MP4, GIF, PNG, or JPG")
-        if codec == "png" and info.width == 2240 and info.height == 1080:
+        if is_image and codec == "png" and info.width == 2240 and info.height == 1080:
             return ConversionPlan("passthrough", ".png")
         if is_still:
             return ConversionPlan("convert-still", ".png")
@@ -216,7 +228,8 @@ class MediaTools:
             argv.extend([
                 "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
                 "-crf", "24", "-maxrate", "8M", "-bufsize", "16M",
-                "-movflags", "+faststart", "-an",
+                "-movflags", "+faststart", "-threads", "2", "-x265-params",
+                "pools=2:frame-threads=2:log-level=error", "-an",
             ])
         if max_bytes is not None:
             argv.extend(["-fs", str(max_bytes)])
@@ -267,12 +280,14 @@ class AdbBackend:
     def __init__(
         self, serial: Optional[str] = None, adb: str = "adb",
         runner: Callable[..., Any] = subprocess.run,
+        popen: Callable[..., Any] = subprocess.Popen,
         which: Callable[[str], Optional[str]] = shutil.which,
         timeout: float = 120.0,
     ) -> None:
         self.serial = serial
         self._adb_name = adb
         self._runner = runner
+        self._popen = popen
         self._which = which
         self._timeout = float(timeout)
 
@@ -327,6 +342,61 @@ class AdbBackend:
             return False
         return getattr(result, "returncode", 0) == 0
 
+    def pull(
+        self, name: str, destination: Path, *, factory: bool = False,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> bool:
+        proto.check_media_name(name)
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ValueError("ADB pull byte limit must be a positive integer")
+        availability = self.available()
+        if not availability.available or availability.serial is None:
+            return False
+        tool = self._tool()
+        assert tool is not None
+        destination = Path(destination)
+        remote_root = REMOTE_FACTORY_MEDIA_DIR if factory else REMOTE_MEDIA_DIR
+        argv = [
+            tool, "-s", availability.serial, "pull",
+            remote_root + "/" + name, str(destination),
+        ]
+        process = None
+        deadline = time.monotonic() + self._timeout
+        try:
+            process = self._popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            while process.poll() is None:
+                if destination.exists() and destination.stat().st_size > max_bytes:
+                    process.kill()
+                    process.communicate()
+                    destination.unlink()
+                    return False
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.communicate()
+                    if destination.exists():
+                        destination.unlink()
+                    return False
+                time.sleep(0.02)
+            process.communicate()
+        except (OSError, subprocess.SubprocessError):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+            if destination.exists():
+                destination.unlink()
+            return False
+        if (
+            getattr(process, "returncode", 1) != 0
+            or not destination.is_file()
+            or destination.stat().st_size > max_bytes
+        ):
+            if destination.exists():
+                destination.unlink()
+            return False
+        return True
+
 
 @dataclass(frozen=True)
 class MediaJobResult:
@@ -343,9 +413,15 @@ class MediaJobResult:
         }
 
 
-async def _call_sync(function: Callable[..., Any], *args: Any) -> Any:
+@dataclass(frozen=True)
+class MediaPreview:
+    data: bytes
+    content_type: str
+
+
+async def _call_sync(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(None, lambda: function(*args))
+    future = loop.run_in_executor(None, lambda: function(*args, **kwargs))
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:
@@ -432,6 +508,7 @@ class MediaManager:
         catalog_loader: Callable[[], MediaCatalog], *,
         max_bytes: int = 256 * 1024 * 1024, idle_timeout: float = 30.0,
         refresh_timeout: float = 10.0,
+        max_concurrent_jobs: int = 2, max_results: int = 128,
     ) -> None:
         self.temp_root = Path(temp_root)
         self.tools = tools
@@ -441,9 +518,20 @@ class MediaManager:
         self.max_bytes = max_bytes
         self.idle_timeout = idle_timeout
         self.refresh_timeout = float(refresh_timeout)
-        if self.refresh_timeout <= 0:
-            raise ValueError("catalog refresh timeout must be positive")
-        self.jobs: Dict[str, MediaJobResult] = {}
+        if (
+            self.refresh_timeout <= 0
+            or isinstance(max_concurrent_jobs, bool)
+            or not isinstance(max_concurrent_jobs, int)
+            or max_concurrent_jobs <= 0
+            or isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results <= 0
+        ):
+            raise ValueError("media refresh and capacity limits must be positive")
+        self.max_concurrent_jobs = max_concurrent_jobs
+        self.max_results = max_results
+        self._active_jobs = 0
+        self.jobs: "OrderedDict[str, MediaJobResult]" = OrderedDict()
 
     def catalog(self) -> MediaCatalog:
         value = self.catalog_loader()
@@ -454,14 +542,64 @@ class MediaManager:
     async def adb_availability(self) -> AdbAvailability:
         return await _call_sync(self.adb.available)
 
-    async def upload(self, stream: Any, original_name: str) -> MediaJobResult:
-        job = MediaJob(
-            self.temp_root, self.tools, self.adb, self._refresh_conn_catalog,
-            max_bytes=self.max_bytes, idle_timeout=self.idle_timeout,
-        )
-        result = await job.run(stream, original_name)
+    @asynccontextmanager
+    async def _admit(self):
+        # All API calls enter on one event loop.  No await between the check
+        # and increment makes admission deterministic and avoids an unbounded
+        # queue of requests waiting behind the media tools.
+        if self._active_jobs >= self.max_concurrent_jobs:
+            raise MediaBusy("media job capacity is full")
+        self._active_jobs += 1
+        try:
+            yield
+        finally:
+            self._active_jobs -= 1
+
+    def _remember(self, result: MediaJobResult) -> None:
+        self.jobs.pop(result.job_id, None)
         self.jobs[result.job_id] = result
-        return result
+        while len(self.jobs) > self.max_results:
+            self.jobs.popitem(last=False)
+
+    async def upload(self, stream: Any, original_name: str) -> MediaJobResult:
+        async with self._admit():
+            job = MediaJob(
+                self.temp_root, self.tools, self.adb, self._refresh_conn_catalog,
+                max_bytes=self.max_bytes, idle_timeout=self.idle_timeout,
+            )
+            result = await job.run(stream, original_name)
+            self._remember(result)
+            return result
+
+    async def preview(self, name: str, kind: str) -> MediaPreview:
+        proto.check_media_name(name)
+        catalog = self.catalog()
+        classification = catalog.classify(name)
+        if classification is None:
+            raise FileNotFoundError(name)
+        if kind not in ("thumbnail", "proxy"):
+            raise ValueError("preview kind must be thumbnail or proxy")
+        async with self._admit():
+            self.temp_root.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="preview-", dir=str(self.temp_root)))
+            source = directory / "source.media"
+            destination = directory / ("thumbnail.jpg" if kind == "thumbnail" else "proxy.mp4")
+            try:
+                pulled = await _call_sync(
+                    self.adb.pull, name, source,
+                    factory=classification == "factory", max_bytes=self.max_bytes,
+                )
+                if not pulled:
+                    raise MediaOperationError("ADB media pull failed")
+                if kind == "thumbnail":
+                    await _call_sync(self.tools.thumbnail, source, destination)
+                    content_type = "image/jpeg"
+                else:
+                    await _call_sync(self.tools.proxy, source, destination)
+                    content_type = "video/mp4"
+                return MediaPreview(destination.read_bytes(), content_type)
+            finally:
+                shutil.rmtree(str(directory), ignore_errors=True)
 
     async def delete(self, name: str) -> MediaJobResult:
         proto.check_media_name(name)
@@ -470,29 +608,30 @@ class MediaManager:
             raise PermissionError("factory media cannot be deleted")
         if name not in before.custom:
             raise FileNotFoundError(name)
-        command = DeviceCommand(
-            proto.POST, proto.RES_MEDIA_DELETE,
-            proto.media_delete_payload(include=[name]), priority=20,
-            coalesce_key="media-delete:{}".format(name),
-            expect_reply=True,
-        )
-        ticket = self.device.submit(command)
-        if hasattr(ticket, "wait"):
-            result = await _call_sync(ticket.wait, 10.0)
-        elif hasattr(ticket, "snapshot"):
-            result = ticket.snapshot()
-        else:
-            raise TypeError("device submit must return a command ticket")
-        if not isinstance(result, CommandResult):
-            raise TypeError("device command returned an invalid result")
-        refreshed = await self._refresh_conn_catalog()
-        confirmed = bool(result.applied and result.acked and name not in refreshed.custom)
-        job_result = MediaJobResult(
-            uuid.uuid4().hex, name, confirmed, confirmed,
-            None if confirmed else result.error or "delete was not confirmed by refreshed conn listing",
-        )
-        self.jobs[job_result.job_id] = job_result
-        return job_result
+        async with self._admit():
+            command = DeviceCommand(
+                proto.POST, proto.RES_MEDIA_DELETE,
+                proto.media_delete_payload(include=[name]), priority=20,
+                coalesce_key="media-delete:{}".format(name),
+                expect_reply=True,
+            )
+            ticket = self.device.submit(command)
+            if hasattr(ticket, "wait"):
+                result = await _call_sync(ticket.wait, 10.0)
+            elif hasattr(ticket, "snapshot"):
+                result = ticket.snapshot()
+            else:
+                raise TypeError("device submit must return a command ticket")
+            if not isinstance(result, CommandResult):
+                raise TypeError("device command returned an invalid result")
+            refreshed = await self._refresh_conn_catalog()
+            confirmed = bool(result.applied and result.acked and name not in refreshed.custom)
+            job_result = MediaJobResult(
+                uuid.uuid4().hex, name, confirmed, confirmed,
+                None if confirmed else result.error or "delete was not confirmed by refreshed conn listing",
+            )
+            self._remember(job_result)
+            return job_result
 
     async def _refresh_conn_catalog(self) -> MediaCatalog:
         """Force a new ``conn`` handshake when the worker supports it.
@@ -518,6 +657,6 @@ class MediaManager:
 
 __all__ = [
     "AdbAvailability", "AdbBackend", "ConversionPlan", "MediaCatalog",
-    "MediaInfo", "MediaJob", "MediaJobResult", "MediaManager", "MediaTools",
-    "ToolUnavailable",
+    "MediaBusy", "MediaInfo", "MediaJob", "MediaJobResult", "MediaManager",
+    "MediaOperationError", "MediaPreview", "MediaTools", "ToolUnavailable",
 ]

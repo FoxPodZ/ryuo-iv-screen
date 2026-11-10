@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from ryuo_screen.media import AdbBackend, MediaCatalog, MediaInfo, MediaJob, MediaTools
+from ryuo_screen.media import (
+    AdbBackend, MediaBusy, MediaCatalog, MediaInfo, MediaJob, MediaManager,
+    MediaTools,
+)
 
 
 class Result:
@@ -116,6 +119,44 @@ def test_adb_availability_selection_and_argv_push(tmp_path):
     assert "shell" not in kwargs
 
 
+def test_adb_pull_uses_selected_device_and_exact_safe_remote_directory(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        return Result("List of devices attached\nA\tdevice product:x\n")
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+            Path(argv[-1]).write_bytes(b"media")
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self):
+            return ("", "")
+
+        def kill(self):
+            self.returncode = -9
+
+    adb = AdbBackend(
+        serial="A", runner=run, popen=Process, which=lambda name: "/bin/adb",
+    )
+    custom = tmp_path / "custom.bin"
+    factory = tmp_path / "factory.bin"
+    assert adb.pull("odd;name.mp4", custom, max_bytes=16) is True
+    assert adb.pull("MiKu.PNG", factory, factory=True, max_bytes=16) is True
+    assert calls[0][0] == [
+        "/bin/adb", "-s", "A", "pull", "/sdcard/pcMedia/odd;name.mp4", str(custom),
+    ]
+    assert calls[1][0] == [
+        "/bin/adb", "-s", "A", "pull", "/sdcard/pcMediaPreset/MiKu.PNG", str(factory),
+    ]
+    assert all("shell" not in kwargs for _, kwargs in calls)
+
+
 @pytest.mark.parametrize("stdout,serial,available", [
     ("List of devices attached\n", None, False),
     ("List of devices attached\nA\tunauthorized\n", "A", False),
@@ -182,3 +223,85 @@ async def test_cancellation_waits_for_background_converter_before_cleanup(tmp_pa
     with pytest.raises(asyncio.CancelledError):
         await task
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_preview_is_authorized_by_exact_conn_catalog_and_cleans_tempdir(tmp_path):
+    class PreviewAdb(FakeAdb):
+        def __init__(self):
+            super().__init__()
+            self.pull_calls = []
+
+        def pull(self, name, destination, *, factory=False, max_bytes=None):
+            self.pull_calls.append((name, Path(destination), factory, max_bytes))
+            Path(destination).write_bytes(b"device-media")
+            return True
+
+    class PreviewTools(FakeTools):
+        def thumbnail(self, source, destination, **kwargs):
+            Path(destination).write_bytes(b"jpeg-preview")
+            return Path(destination)
+
+        def proxy(self, source, destination, **kwargs):
+            Path(destination).write_bytes(b"mp4-proxy")
+            return Path(destination)
+
+    adb = PreviewAdb()
+    catalog = MediaCatalog(("MiKu.PNG",), ("custom.mp4",))
+    manager = MediaManager(
+        tmp_path, PreviewTools(), adb, object(), lambda: catalog,
+        max_bytes=32, max_concurrent_jobs=2,
+    )
+    thumbnail = await manager.preview("MiKu.PNG", "thumbnail")
+    proxy = await manager.preview("custom.mp4", "proxy")
+    assert thumbnail.data == b"jpeg-preview" and thumbnail.content_type == "image/jpeg"
+    assert proxy.data == b"mp4-proxy" and proxy.content_type == "video/mp4"
+    assert adb.pull_calls[0][2] is True and adb.pull_calls[1][2] is False
+    with pytest.raises(FileNotFoundError):
+        await manager.preview("miku.png", "thumbnail")
+    with pytest.raises(ValueError):
+        await manager.preview("../custom.mp4", "proxy")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_media_manager_bounds_active_jobs_and_terminal_result_retention(tmp_path):
+    class GateStream:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def read(self, size):
+            self.started.set()
+            await self.release.wait()
+            return b""
+
+    adb = FakeAdb()
+    manager = MediaManager(
+        tmp_path, FakeTools(), adb, object(), lambda: MediaCatalog(),
+        max_bytes=32, max_concurrent_jobs=2, max_results=2,
+    )
+    streams = [GateStream(), GateStream()]
+    tasks = [asyncio.create_task(manager.upload(stream, "x.mp4")) for stream in streams]
+    await asyncio.gather(*(stream.started.wait() for stream in streams))
+    assert len(list(tmp_path.iterdir())) == 2
+    with pytest.raises(MediaBusy):
+        await manager.upload(Stream([b"x"]), "busy.mp4")
+    assert len(list(tmp_path.iterdir())) == 2
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert list(tmp_path.iterdir()) == []
+
+    custom = []
+
+    def refresh():
+        custom.append(adb.calls[-1][1])
+        return MediaCatalog((), tuple(custom))
+
+    manager.catalog_loader = refresh
+    manager._refresh_conn_catalog = refresh
+    results = [await manager.upload(Stream([b"x"]), "x.mp4") for _ in range(3)]
+    assert len(manager.jobs) == 2
+    assert results[0].job_id not in manager.jobs
+    assert list(manager.jobs) == [results[1].job_id, results[2].job_id]
