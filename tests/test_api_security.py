@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import asyncio
+import json
 import time
 
 import pytest
@@ -56,6 +57,40 @@ async def _client(tmp_path, policy):
     )
     await client.start_server()
     return client, context, device
+
+
+async def _raw_patch(client, headers):
+    body = b'{"brightness":77}'
+    reader, writer = await asyncio.open_connection(
+        client.server.host, client.server.port
+    )
+    request = [b"PATCH /api/v1/brightness HTTP/1.1"]
+    request.extend(
+        "{}: {}".format(name, value).encode("ascii") for name, value in headers
+    )
+    request.extend(
+        (
+            b"If-Match: 1",
+            b"Content-Type: application/json",
+            "Content-Length: {}".format(len(body)).encode("ascii"),
+            b"Connection: close",
+            b"",
+            body,
+        )
+    )
+    writer.write(b"\r\n".join(request))
+    await writer.drain()
+    response = await reader.read()
+    writer.close()
+    await writer.wait_closed()
+    head, payload = response.split(b"\r\n\r\n", 1)
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    text = payload.decode("utf-8")
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        document = {"message": text}
+    return status, document
 
 
 def _local_policy():
@@ -312,6 +347,66 @@ async def test_forwarded_chain_cannot_spoof_loopback_and_incomplete_forms_fail_c
     assert spoofed_chain.status == 401
     assert missing_client.status == 403
     assert standard_forwarded.status == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted_proxy", ["127.0.0.0/8", "10.0.0.0/8"])
+async def test_duplicate_security_headers_fail_closed_before_mutation(
+    tmp_path, trusted_proxy
+):
+    policy = _lan_policy(trusted_proxy=trusted_proxy)
+    client, context, device = await _client(tmp_path, policy)
+    cases = {
+        "Host": [
+            ("Host", "192.168.1.50"),
+            ("Host", "192.168.1.50"),
+            ("Origin", "http://192.168.1.50"),
+        ],
+        "Origin": [
+            ("Host", "192.168.1.50"),
+            ("Origin", "http://192.168.1.50"),
+            ("Origin", "http://192.168.1.50"),
+        ],
+        "Forwarded": [
+            ("Host", "192.168.1.50"),
+            ("Origin", "http://192.168.1.50"),
+            ("Forwarded", "for=192.168.1.70"),
+            ("Forwarded", "for=127.0.0.1"),
+        ],
+        "X-Forwarded-For": [
+            ("Host", "192.168.1.50"),
+            ("Origin", "http://192.168.1.50"),
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Forwarded-For", "192.168.1.70"),
+        ],
+        "X-Forwarded-Host": [
+            ("Host", "internal.invalid"),
+            ("Origin", "https://screen.example"),
+            ("X-Forwarded-For", "192.168.1.70"),
+            ("X-Forwarded-Host", "screen.example"),
+            ("X-Forwarded-Host", "localhost"),
+            ("X-Forwarded-Proto", "https"),
+        ],
+        "X-Forwarded-Proto": [
+            ("Host", "internal.invalid"),
+            ("Origin", "https://screen.example"),
+            ("X-Forwarded-For", "192.168.1.70"),
+            ("X-Forwarded-Host", "screen.example"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Proto", "http"),
+        ],
+    }
+    try:
+        for name, raw_headers in cases.items():
+            status, body = await _raw_patch(client, raw_headers)
+            assert status == (400 if name == "Host" else 403), name
+            assert "duplicate" in body["message"].lower(), name
+    finally:
+        await client.close()
+
+    assert context.state.revision == 1
+    assert context.state.brightness != 77
+    assert device.commands == []
 
 
 @pytest.mark.asyncio

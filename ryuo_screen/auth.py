@@ -35,6 +35,14 @@ _BODY_METHODS = frozenset(("POST", "PUT", "PATCH"))
 _FORWARDED_HEADERS = frozenset(
     ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto")
 )
+_SINGLETON_SECURITY_HEADERS = {
+    b"host": "Host",
+    b"origin": "Origin",
+    b"forwarded": "Forwarded",
+    b"x-forwarded-for": "X-Forwarded-For",
+    b"x-forwarded-host": "X-Forwarded-Host",
+    b"x-forwarded-proto": "X-Forwarded-Proto",
+}
 
 
 def _b64encode(value: bytes) -> str:
@@ -474,6 +482,19 @@ def _origin_matches(origin: str, host: str, scheme: str) -> bool:
         return False
 
 
+def _reject_duplicate_security_headers(request: web.Request) -> None:
+    """Reject ambiguous raw fields before the multidict selects a value."""
+    seen = set()
+    for raw_name, _raw_value in request.raw_headers:
+        normalized = raw_name.lower()
+        display_name = _SINGLETON_SECURITY_HEADERS.get(normalized)
+        if display_name is None:
+            continue
+        if normalized in seen:
+            raise PermissionError("duplicate {} header".format(display_name))
+        seen.add(normalized)
+
+
 def _forwarded_context(
     request: web.Request, policy: SecurityPolicy
 ) -> Tuple[str, str, bool, Optional[str]]:
@@ -512,6 +533,7 @@ def _forwarded_context(
 async def security_middleware(request: web.Request, handler):
     policy: SecurityPolicy = request.app[SECURITY_KEY]
     try:
+        _reject_duplicate_security_headers(request)
         host, scheme, trusted, client = _forwarded_context(request, policy)
         if not policy.allows_host(host, from_trusted_proxy=trusted):
             raise PermissionError("Host is not allowed")
