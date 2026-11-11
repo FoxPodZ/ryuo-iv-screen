@@ -230,3 +230,34 @@ async def test_boolean_body_revision_cannot_alias_integer_if_match(tmp_path):
     assert body["error"] == "validation_error"
     assert context.state_store.load().revision == 4
     assert device.commands == []
+
+
+@pytest.mark.asyncio
+async def test_static_web_root_serves_index_and_hashed_assets_but_rejects_traversal(tmp_path):
+    web_root = tmp_path / "dist"
+    assets = web_root / "assets"
+    assets.mkdir(parents=True)
+    (web_root / "index.html").write_text("<html>dashboard</html>", encoding="utf-8")
+    (assets / "index-AbC123xy.js").write_text("console.log('ryuo')", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("do not serve", encoding="utf-8")
+
+    client, context, _ = await _client(tmp_path)
+    context.web_root = web_root
+    try:
+        index = await client.get("/")
+        index_text = await index.text()
+        asset = await client.get("/assets/index-AbC123xy.js")
+        asset_text = await asset.text()
+        traversal = await client.get("/..%2fsecret.txt")
+        missing_api = await client.get("/api/v1/not-a-route")
+    finally:
+        await client.close()
+
+    assert index.status == 200
+    assert index_text == "<html>dashboard</html>"
+    assert index.headers["Cache-Control"] == "no-store"
+    assert asset.status == 200
+    assert asset_text == "console.log('ryuo')"
+    assert asset.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+    assert traversal.status == 404
+    assert missing_api.status == 404

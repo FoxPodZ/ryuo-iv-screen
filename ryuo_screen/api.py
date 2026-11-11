@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 from dataclasses import asdict, dataclass, is_dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from aiohttp import web
@@ -34,6 +36,8 @@ from .store import (
 
 
 API_PREFIX = "/api/v1"
+_DEFAULT_WEB_ROOT = Path(__file__).resolve().parent.parent / "web" / "dist"
+_HASHED_ASSET = re.compile(r"^assets/.+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
 _SERIAL_KEYS = frozenset(
     ("serial", "serialnumber", "serial_number", "device_serial", "deviceserial", "sn")
 )
@@ -145,6 +149,7 @@ class AppContext:
     sse_heartbeat: float = 15.0
     media: Optional[MediaManager] = None
     security: Optional[SecurityPolicy] = None
+    web_root: Optional[Path] = None
 
     def __post_init__(self) -> None:
         if self.sse_heartbeat <= 0:
@@ -154,6 +159,7 @@ class AppContext:
         self._live_task = None
         if self.security is None:
             self.security = SecurityPolicy.from_config(AppConfig())
+        self.web_root = Path(self.web_root) if self.web_root is not None else _DEFAULT_WEB_ROOT
         if self.sse is None:
             self.sse = SseHub(self.snapshot_document())
 
@@ -712,6 +718,36 @@ async def _events(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def _web_asset(request: web.Request) -> web.StreamResponse:
+    """Serve only files contained by the checked-in Vite distribution."""
+    context: AppContext = request.app[CONTEXT_KEY]
+    path = request.match_info.get("path", "")
+    if path.startswith("api/") or "\x00" in path or "\\" in path:
+        raise web.HTTPNotFound()
+    relative = "index.html" if path in ("", "/") else path.strip("/")
+    parts = tuple(relative.split("/"))
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise web.HTTPNotFound()
+    assert context.web_root is not None
+    root = context.web_root.resolve()
+    candidate = root.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise web.HTTPNotFound()
+    if not candidate.is_file():
+        raise web.HTTPNotFound()
+    cache = (
+        "public, max-age=31536000, immutable"
+        if _HASHED_ASSET.fullmatch(relative)
+        else "no-store"
+    )
+    return web.FileResponse(candidate, headers={
+        "Cache-Control": cache,
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 async def _live_events_context(app: web.Application):
     context: AppContext = app[CONTEXT_KEY]
     await context.start_live_publisher()
@@ -756,6 +792,8 @@ def create_app(context: AppContext) -> web.Application:
     app.router.add_get(API_PREFIX + "/profiles/{slug}", _get_profile)
     app.router.add_patch(API_PREFIX + "/profiles/{slug}", _update_profile)
     app.router.add_delete(API_PREFIX + "/profiles/{slug}", _delete_profile)
+    app.router.add_get("/", _web_asset)
+    app.router.add_get("/{path:.*}", _web_asset)
     return app
 
 

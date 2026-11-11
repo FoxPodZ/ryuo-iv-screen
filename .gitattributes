@@ -3,3 +3,7 @@
 * text=auto eol=lf
 *.png binary
 *.mp4 binary
+
+# Generated Vite chunks embed upstream regular-expression whitespace inside
+# template literals; do not treat that machine output as hand-edited prose.
+web/dist/** -whitespace
