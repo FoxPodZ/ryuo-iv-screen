@@ -215,6 +215,38 @@ async def test_screen_patch_validates_before_saving(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_multibyte_screen_config_is_rejected_before_save_or_device_queue(tmp_path):
+    client, context, device = await _client(tmp_path)
+    original = context.state_store.path.read_bytes()
+    label = "🔥" * 32
+    slots = [
+        {
+            "enabled": True,
+            "measurement_id": "fan.{}.rpm".format(index),
+            "widget": "Fan Speed " + label,
+            "label": label,
+        }
+        for index in range(6)
+    ]
+    try:
+        response = await client.patch(
+            "/api/v1/screen",
+            headers={"If-Match": "4"},
+            json={"slots": slots},
+        )
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 400
+    assert body["error"] == "validation_error"
+    assert "1024-byte report" in body["message"]
+    assert context.state_store.path.read_bytes() == original
+    assert context.state.revision == 4
+    assert device.commands == []
+
+
+@pytest.mark.asyncio
 async def test_boolean_body_revision_cannot_alias_integer_if_match(tmp_path):
     client, context, device = await _client(tmp_path)
     try:

@@ -106,11 +106,15 @@ def test_custom_fan_slot_label_gets_matching_keepalive_alias():
         def catalog(self):
             return (SensorDescriptor(ref, "fan.aio.rpm", "AIO Pump", "RPM"),)
 
-        def to_pc_info(self, value, *, extra_readouts=None):
+        def to_pc_info(self, value, *, extra_readouts=None, fan_aliases=None):
             assert value is snapshot
             assert extra_readouts is None
             return proto.pc_info(fans=[{
-                "onBoard": True, "name": "AIO Pump", "value": 1830,
+                "onBoard": True,
+                "name": (fan_aliases or {}).get(
+                    ("fan.aio.rpm", ref), "AIO Pump"
+                ),
+                "value": 1830,
             }])
 
     telemetry = StructuredTelemetry()
@@ -171,9 +175,14 @@ def test_six_long_fan_aliases_replace_originals_and_keep_all_frame_bounded():
         def catalog(self):
             return tuple(descriptors)
 
-        def to_pc_info(self, value, *, extra_readouts=None):
+        def to_pc_info(self, value, *, extra_readouts=None, fan_aliases=None):
             fans = [
-                {"onBoard": True, "name": descriptor.label,
+                {"onBoard": True,
+                 "name": (fan_aliases or {}).get(
+                     (descriptor.measurement_id,
+                      value.measurements[descriptor.measurement_id].ref),
+                     descriptor.label,
+                 ),
                  "value": int(value.measurements[descriptor.measurement_id].value)}
                 for descriptor in descriptors
             ]
@@ -202,6 +211,121 @@ def test_fan_alias_longer_than_safe_protocol_bound_is_rejected():
         SlotAssignment(
             True, "fan.case.rpm", "Fan Speed " + "x" * 33, "x" * 33
         )
+
+
+def test_duplicate_fan_display_labels_are_aliased_by_stable_ref():
+    first_ref = SensorRef("hwmon", "board-a", "fan1_input")
+    second_ref = SensorRef("hwmon", "board-b", "fan1_input")
+    snapshot = TelemetrySnapshot({
+        "fan.intake.rpm": Measurement(
+            first_ref, "fan.intake.rpm", 1100, "RPM", 1.0, available=True
+        ),
+        "fan.exhaust.rpm": Measurement(
+            second_ref, "fan.exhaust.rpm", 900, "RPM", 1.0, available=True
+        ),
+    }, 1.0)
+    descriptors = (
+        SensorDescriptor(first_ref, "fan.intake.rpm", "Fan 1", "RPM"),
+        SensorDescriptor(second_ref, "fan.exhaust.rpm", "Fan 1", "RPM"),
+    )
+
+    class StructuredTelemetry:
+        def sample(self):
+            return snapshot
+
+        def catalog(self):
+            return descriptors
+
+        def to_pc_info(self, value, *, fan_aliases=None):
+            aliases = fan_aliases or {}
+            return proto.pc_info(fans=[
+                {
+                    "onBoard": True,
+                    "name": aliases.get((key, reading.ref), "Fan 1"),
+                    "value": int(reading.value),
+                }
+                for key, reading in value.measurements.items()
+            ], timestamp_ms=1)
+
+    slots = (
+        SlotAssignment(True, "fan.intake.rpm", "Fan Speed Intake", "Intake"),
+        SlotAssignment(True, "fan.exhaust.rpm", "Fan Speed Exhaust", "Exhaust"),
+    ) + tuple(SlotAssignment() for _ in range(4))
+    worker = DeviceWorker(
+        FakeTransport(), StructuredTelemetry(), state=ScreenState(slots=slots)
+    )
+
+    payload = worker._collect_telemetry()
+
+    assert [(fan["name"], fan["value"]) for fan in payload["fans"]] == [
+        ("Intake", 1100), ("Exhaust", 900)
+    ]
+
+
+def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
+    measurements = {}
+    descriptors = []
+    slots = []
+    for index in range(6):
+        key = "fan.case{}.rpm".format(index)
+        ref = SensorRef("hwmon", "nct6799", "fan{}_input".format(index + 1))
+        measurements[key] = Measurement(ref, key, 1, "RPM", 1.0, available=True)
+        descriptors.append(SensorDescriptor(ref, key, "F{}".format(index), "RPM"))
+        label = "A{}".format(index) + "x" * 30
+        slots.append(SlotAssignment(True, key, "Fan Speed " + label, label))
+    snapshot = TelemetrySnapshot(measurements, 1.0)
+
+    class StructuredTelemetry:
+        def sample(self):
+            return snapshot
+
+        def catalog(self):
+            return tuple(descriptors)
+
+        def to_pc_info(self, value, *, fan_aliases=None):
+            aliases = fan_aliases or {}
+            return proto.pc_info(fans=[
+                {
+                    "onBoard": True,
+                    "name": aliases.get((key, reading.ref), "F{}".format(index)),
+                    "value": int(reading.value),
+                }
+                for index, (key, reading) in enumerate(value.measurements.items())
+            ], timestamp_ms=1)
+
+    # Find a runtime magnitude where original names still fit but aliases do
+    # not. This avoids coupling the regression to JSON encoder byte counts.
+    telemetry = StructuredTelemetry()
+    aliases = {
+        (slot.measurement_id, snapshot.measurements[slot.measurement_id].ref): slot.label
+        for slot in slots
+    }
+    for digits in range(1, 200):
+        huge = 10 ** digits
+        for reading in snapshot.measurements.values():
+            object.__setattr__(reading, "value", huge)
+        original = telemetry.to_pc_info(snapshot)
+        aliased = telemetry.to_pc_info(snapshot, fan_aliases=aliases)
+        try:
+            proto.request(proto.POST, proto.RES_ALL, original, seq=2_147_483_647)
+        except ValueError as exc:  # pragma: no cover - aliases must cross first
+            raise AssertionError("base telemetry crossed the limit before aliases") from exc
+        try:
+            proto.request(proto.POST, proto.RES_ALL, aliased, seq=2_147_483_647)
+        except ValueError:
+            break
+    else:  # pragma: no cover - protocol constants would have changed
+        raise AssertionError("test could not find the alias-only frame boundary")
+
+    worker = DeviceWorker(
+        FakeTransport(), telemetry, state=ScreenState(slots=tuple(slots))
+    )
+    payload = worker._collect_telemetry()
+
+    assert [fan["name"] for fan in payload["fans"]] == [
+        "F{}".format(index) for index in range(6)
+    ]
+    proto.request(proto.POST, proto.RES_ALL, payload, seq=2_147_483_647)
 
 
 def test_queue_is_bounded_and_equivalent_commands_coalesce():
@@ -346,7 +470,8 @@ def test_latest_telemetry_cache_is_populated_only_by_owner_thread_and_is_defensi
                 ),
             )
 
-        def to_pc_info(self, snapshot):
+        def to_pc_info(self, snapshot, *, fan_aliases=None):
+            assert not fan_aliases
             return proto.pc_info(cpu={"temperature": 41}, timestamp_ms=1)
 
     transport = FakeTransport()

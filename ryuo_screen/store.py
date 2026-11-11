@@ -14,6 +14,7 @@ try:  # pragma: no cover - selected by the interpreter version
 except ImportError:  # Python 3.8-3.10
     import tomli as tomllib  # type: ignore
 
+import ryuo_proto as proto
 from ryuo_proto import MODE_FULL, MODE_SPLIT, PLAY_MODES, PLAY_SINGLE
 
 from .models import SensorRef
@@ -416,7 +417,9 @@ class StateStore:
             if not isinstance(document, dict):
                 raise TypeError("state root must be an object")
             document = self._migrate(document)
-            return ScreenState.from_dict(document)
+            state = ScreenState.from_dict(document)
+            self._validate_wire(state)
+            return state
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             self.last_error = "state load failed: {}".format(exc)
             return ScreenState()
@@ -424,8 +427,21 @@ class StateStore:
     def save(self, state: ScreenState) -> None:
         if not isinstance(state, ScreenState):
             raise TypeError("state must be a ScreenState")
+        self._validate_wire(state)
         _atomic_write_json(self.path, state.to_dict(), STATE_MODE)
         self.last_error = None
+
+    @staticmethod
+    def _validate_wire(state: ScreenState) -> None:
+        # State is persisted before device admission so reconnect can apply it.
+        # Therefore reject anything that cannot fit the firmware's single
+        # report before the atomic write, using the widest supported sequence.
+        proto.request(
+            proto.POST,
+            proto.RES_CONFIG,
+            proto.config_payload_from_state(state),
+            seq=2_147_483_647,
+        )
 
     @staticmethod
     def _migrate(document: Mapping[str, Any]) -> Dict[str, Any]:

@@ -142,6 +142,7 @@ class TelemetryCollector:
     def to_pc_info(
         self, snapshot: TelemetrySnapshot, *,
         extra_readouts: Optional[Mapping[str, _Number]] = None,
+        fan_aliases: Optional[Mapping[Tuple[str, SensorRef], str]] = None,
     ) -> dict:
         """Build the legacy payload; unavailable values become zero here.
 
@@ -162,7 +163,10 @@ class TelemetryCollector:
         fans = [
             {
                 "onBoard": True,
-                "name": labels.get((key, reading.ref), reading.ref.channel),
+                "name": (fan_aliases or {}).get(
+                    (key, reading.ref),
+                    labels.get((key, reading.ref), reading.ref.channel),
+                ),
                 "value": int(_number(reading)),
             }
             for key, reading in measurements.items()

@@ -135,6 +135,28 @@ def test_gpu_and_fan_values_preserve_existing_protocol_fields():
     assert proto.fan_item(result["fans"][-1]["name"]) == "Fan Speed Coolant"
 
 
+def test_fan_aliases_use_measurement_and_stable_ref_not_duplicate_display_label():
+    intake = _Provider("intake", {
+        "fan.intake.rpm": (1100, "Fan 1", "RPM"),
+    })
+    exhaust = _Provider("exhaust", {
+        "fan.exhaust.rpm": (900, "Fan 1", "RPM"),
+    })
+    collector = TelemetryCollector([intake, exhaust])
+    sample = collector.sample()
+    aliases = {
+        ("fan.intake.rpm", sample.measurements["fan.intake.rpm"].ref): "Intake",
+        ("fan.exhaust.rpm", sample.measurements["fan.exhaust.rpm"].ref): "Exhaust",
+    }
+
+    result = collector.to_pc_info(sample, fan_aliases=aliases)
+
+    assert result["fans"] == [
+        {"onBoard": True, "name": "Intake", "value": 1100},
+        {"onBoard": True, "name": "Exhaust", "value": 900},
+    ]
+
+
 def test_gpu_selection_never_fills_an_unavailable_field_from_another_gpu():
     amd = _Provider("amd", {"gpu.load": (42, "GPU load", "%"), "gpu.fan": (None, "Fan", "RPM")})
     nvidia = _Provider("nvidia", {

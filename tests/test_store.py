@@ -120,6 +120,28 @@ def test_state_restart_round_trip_and_permissions(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o640
 
 
+def test_state_save_rejects_multibyte_config_before_replacing_desired_state(tmp_path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.save(ScreenState(revision=1))
+    original = path.read_bytes()
+    label = "🔥" * 32
+    oversized = ScreenState(
+        revision=2,
+        slots=tuple(
+            SlotAssignment(True, "fan.{}.rpm".format(index),
+                           "Fan Speed " + label, label)
+            for index in range(6)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="1024-byte report"):
+        store.save(oversized)
+
+    assert path.read_bytes() == original
+    assert store.load().revision == 1
+
+
 def test_state_save_fsyncs_temp_and_parent_before_atomic_replace(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
     calls = []

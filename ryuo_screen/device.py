@@ -744,23 +744,31 @@ class DeviceWorker:
                         and item.ref == reading.ref and item.unit == "RPM"
                     )), None)
                     if descriptor is not None:
-                        aliases[descriptor.label] = slot.label
+                        aliases[(slot.measurement_id, reading.ref)] = slot.label
             value = self._telemetry.to_pc_info(snapshot)
-            if aliases and isinstance(value, Mapping):
-                fans = value.get("fans")
-                if isinstance(fans, list):
-                    renamed = []
-                    for fan in fans:
-                        item = dict(fan) if isinstance(fan, Mapping) else fan
-                        if isinstance(item, dict) and item.get("name") in aliases:
-                            item["name"] = aliases[item["name"]]
-                        renamed.append(item)
-                    value = dict(value)
-                    value["fans"] = renamed
+            if aliases:
+                aliased = self._telemetry.to_pc_info(
+                    snapshot, fan_aliases=aliases
+                )
+                try:
+                    proto.request(
+                        proto.POST, proto.RES_ALL, aliased, seq=MAX_SEQUENCE
+                    )
+                except ValueError:
+                    # Telemetry magnitude can grow after state admission. A
+                    # cosmetic alias must never turn a valid keepalive into a
+                    # reconnect loop; retain the stable original names.
+                    pass
+                else:
+                    value = aliased
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(snapshot, catalog, None)
         if not isinstance(value, Mapping):
             raise TypeError("telemetry source must return a mapping")
+        # Oversized runtime samples are collection failures. _send_keepalive
+        # then reuses the previously bounded safe payload instead of writing a
+        # frame the firmware will drop and reconnecting forever.
+        proto.request(proto.POST, proto.RES_ALL, value, seq=MAX_SEQUENCE)
         return dict(value)
 
     def _send(
