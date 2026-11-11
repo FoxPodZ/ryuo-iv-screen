@@ -1,6 +1,8 @@
 import type {
   AuthStatus,
   DeviceDocument,
+  MutationResult,
+  SensorsResponse,
   SnapshotDocument,
   StateResponse,
   TelemetryDocument,
@@ -8,6 +10,8 @@ import type {
 import type {EventConnection, EventConnector} from "./store";
 
 const API = "/api/v1";
+
+export type ScreenPatchKind = "brightness" | "screen" | "telemetry-settings";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -86,6 +90,25 @@ export class ApiClient {
       telemetry,
       device,
     };
+  }
+
+  async loadSensors(): Promise<SensorsResponse> {
+    return this.request<SensorsResponse>("/sensors");
+  }
+
+  async patchState(
+    kind: ScreenPatchKind,
+    revision: number,
+    changes: Record<string, unknown>,
+  ): Promise<MutationResult> {
+    return this.request<MutationResult>(`/${kind}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "If-Match": String(revision),
+      },
+      body: JSON.stringify({revision, ...changes}),
+    });
   }
 }
 

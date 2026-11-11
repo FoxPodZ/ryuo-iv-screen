@@ -7,7 +7,7 @@ from dataclasses import replace
 import ryuo_proto as proto
 from ryuo_screen.device import DeviceCommand, DeviceWorker, LatestTelemetry
 from ryuo_screen.models import Measurement, SensorDescriptor, SensorRef, TelemetrySnapshot
-from ryuo_screen.store import ScreenState
+from ryuo_screen.store import ScreenState, SlotAssignment
 
 
 def _reply(payload):
@@ -88,6 +88,64 @@ def test_all_transport_io_and_sequences_are_owned_by_one_worker_thread():
     assert len(ids) == 1
     assert sequences == sorted(sequences)
     assert len(sequences) == len(set(sequences))
+
+
+def test_custom_fan_slot_label_gets_matching_keepalive_alias():
+    ref = SensorRef("hwmon", "nct6799", "fan2_input")
+    snapshot = TelemetrySnapshot({
+        "fan.aio.rpm": Measurement(
+            ref, "fan.aio.rpm", 1830, "RPM", 1.0, available=True
+        )
+    }, 1.0)
+
+    class StructuredTelemetry:
+        extra = None
+
+        def sample(self):
+            return snapshot
+
+        def catalog(self):
+            return (SensorDescriptor(ref, "fan.aio.rpm", "AIO Pump", "RPM"),)
+
+        def to_pc_info(self, value, *, extra_readouts=None):
+            assert value is snapshot
+            self.extra = extra_readouts
+            return proto.pc_info(fans=[
+                {"onBoard": True, "name": name, "value": int(reading)}
+                for name, reading in (extra_readouts or {}).items()
+            ])
+
+    telemetry = StructuredTelemetry()
+    slots = (
+        SlotAssignment(True, "fan.aio.rpm", "Fan Speed Coolant", "Coolant"),
+    ) + tuple(SlotAssignment() for _ in range(5))
+    worker = DeviceWorker(FakeTransport(), telemetry, state=ScreenState(slots=slots))
+
+    payload = worker._collect_telemetry()
+
+    assert telemetry.extra == {"Coolant": 1830}
+    assert payload["fans"] == [
+        {"onBoard": True, "name": "Coolant", "value": 1830}
+    ]
+
+
+def test_thermal_rgb_builds_incremental_preset_from_owner_snapshot():
+    ref = SensorRef("amd", "0000:03:00.0", "temp1_input")
+    snapshot = TelemetrySnapshot({
+        "gpu.temperature": Measurement(
+            ref, "gpu.temperature", 70, "C", 1.0, available=True
+        )
+    }, 1.0)
+    state = ScreenState(
+        rgb_mode="thermal", rgb_target="both", thermal_source="gpu.temperature"
+    )
+    worker = DeviceWorker(FakeTransport(), lambda: proto.pc_info(), state=state)
+    worker._latest_telemetry = LatestTelemetry(snapshot)
+
+    payload = worker._dynamic_preset_payload(2.0)
+
+    assert payload["settings"]["titleColor"] == proto.thermal_hex(70)
+    assert payload["settings"]["contentColor"] == proto.thermal_hex(70)
 
 
 def test_queue_is_bounded_and_equivalent_commands_coalesce():

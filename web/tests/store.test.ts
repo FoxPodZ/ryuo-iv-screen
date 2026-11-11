@@ -1,7 +1,7 @@
 import {describe, expect, it, vi} from "vitest";
 
-import type {AuthStatus, SnapshotDocument} from "../src/api-types";
-import {ApiError, EventStream} from "../src/api";
+import type {AuthStatus, MutationResult, SensorsResponse, SnapshotDocument} from "../src/api-types";
+import {ApiError, EventStream, type ScreenPatchKind} from "../src/api";
 import {AppStore, type ApiGateway, type EventConnection, type EventConnector} from "../src/store";
 
 const snapshot = (revision: number, brightness = 85): SnapshotDocument => ({
@@ -33,6 +33,8 @@ class FakeApi implements ApiGateway {
   auth: AuthStatus = {required: false, authenticated: true, csrfToken: null};
   current = snapshot(1);
   loginCalls: string[] = [];
+  patchCalls: Array<{kind: ScreenPatchKind; revision: number; changes: Record<string, unknown>}> = [];
+  patchError: ApiError | null = null;
 
   async authStatus(): Promise<AuthStatus> { return this.auth; }
   async loadSnapshot(): Promise<SnapshotDocument> { return this.current; }
@@ -41,6 +43,15 @@ class FakeApi implements ApiGateway {
     if (password === "bad") throw new ApiError(401, "invalid_credentials", "Неверный пароль");
     this.auth = {required: true, authenticated: true, csrfToken: "csrf", expiresIn: 10};
     return this.auth;
+  }
+  async loadSensors(): Promise<SensorsResponse> {
+    return {sensors: [], error: null};
+  }
+  async patchState(kind: ScreenPatchKind, revision: number, changes: Record<string, unknown>): Promise<MutationResult> {
+    this.patchCalls.push({kind, revision, changes});
+    if (this.patchError) throw this.patchError;
+    this.current = snapshot(revision + 1, typeof changes.brightness === "number" ? changes.brightness : this.current.state.brightness);
+    return {revision: revision + 1, saved: true, queued: true, applied: false, acked: false, error: null};
   }
 }
 
@@ -215,5 +226,22 @@ describe("AppStore", () => {
     const localStore = new AppStore(localApi, new ManualConnector(), localScheduled);
     await localStore.start();
     expect(localScheduled).not.toHaveBeenCalled();
+  });
+
+  it("patches the current revision and refreshes on success or conflict without overwriting", async () => {
+    const api = new FakeApi();
+    const store = new AppStore(api, new ManualConnector());
+    await store.start();
+    await store.patchScreen("brightness", {brightness: 44});
+    expect(api.patchCalls[0]).toEqual({kind: "brightness", revision: 1, changes: {brightness: 44}});
+    expect(store.value.snapshot?.revision).toBe(2);
+    expect(store.value.snapshot?.state.brightness).toBe(44);
+
+    api.current = snapshot(3, 77);
+    api.patchError = new ApiError(409, "revision_conflict", "stale");
+    await store.patchScreen("screen", {opacity: 50});
+    expect(store.value.snapshot?.revision).toBe(3);
+    expect(store.value.snapshot?.state.brightness).toBe(77);
+    expect(store.value.mutationError).toContain("Конфликт ревизий");
   });
 });

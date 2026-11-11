@@ -12,6 +12,37 @@ export interface SlotAssignment {
   label: string | null;
 }
 
+export interface SensorRefDocument {
+  provider: string;
+  device: string;
+  channel: string;
+}
+
+export interface SensorDescriptorDocument {
+  ref: SensorRefDocument;
+  measurementId: string;
+  label: string;
+  unit: string;
+  available: boolean;
+  source: string | null;
+  metadata: Record<string, unknown>;
+  error: string | null;
+}
+
+export interface SensorsResponse {
+  sensors: SensorDescriptorDocument[];
+  error: string | null;
+}
+
+export interface MutationResult {
+  revision: number;
+  saved: boolean;
+  queued: boolean;
+  applied: boolean;
+  acked: boolean;
+  error: string | null;
+}
+
 export interface ScreenStateDocument {
   schema_version: number;
   revision: number;

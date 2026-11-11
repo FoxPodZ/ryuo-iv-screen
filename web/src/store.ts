@@ -1,5 +1,11 @@
-import {ApiError, type ApiClient} from "./api";
-import type {AuthStatus, SnapshotDocument} from "./api-types";
+import {ApiError, type ApiClient, type ScreenPatchKind} from "./api";
+import type {
+  AuthStatus,
+  MutationResult,
+  SensorDescriptorDocument,
+  SensorsResponse,
+  SnapshotDocument,
+} from "./api-types";
 
 export type AppPhase = "loading" | "ready" | "login" | "error";
 
@@ -12,6 +18,8 @@ export interface AppView {
   connected: boolean;
   lastEventId: number;
   retryDelay: number;
+  sensors?: readonly SensorDescriptorDocument[];
+  mutationError?: string | null;
 }
 
 export interface ApiGateway {
@@ -19,6 +27,12 @@ export interface ApiGateway {
   loadSnapshot(): Promise<SnapshotDocument>;
   login(password: string): Promise<AuthStatus>;
   setCsrfToken?(value: string | null): void;
+  loadSensors?(): Promise<SensorsResponse>;
+  patchState?(
+    kind: ScreenPatchKind,
+    revision: number,
+    changes: Record<string, unknown>,
+  ): Promise<MutationResult>;
 }
 
 export interface EventConnection { close(): void; }
@@ -52,6 +66,8 @@ const initialView = (): AppView => ({
   connected: false,
   lastEventId: 0,
   retryDelay: 500,
+  sensors: [],
+  mutationError: null,
 });
 
 const errorMessage = (error: unknown): string => error instanceof Error
@@ -125,6 +141,47 @@ export class AppStore {
       await this.loadAndConnect(this.sessionGeneration);
     } catch (error) {
       this.handleLoadError(error, true);
+    }
+  }
+
+  async ensureSensors(): Promise<void> {
+    if ((this.state.sensors?.length ?? 0) > 0 || !this.api.loadSensors) return;
+    try {
+      const response = await this.api.loadSensors();
+      this.update({sensors: response.sensors, mutationError: response.error});
+    } catch (error) {
+      this.update({mutationError: `Не удалось загрузить датчики: ${errorMessage(error)}`});
+    }
+  }
+
+  async patchScreen(
+    kind: ScreenPatchKind,
+    changes: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.api.patchState || !this.state.snapshot) {
+      this.update({mutationError: "Редактор ещё не получил текущее состояние"});
+      return;
+    }
+    const revision = this.state.snapshot.revision;
+    try {
+      await this.api.patchState(kind, revision, changes);
+      const snapshot = await this.api.loadSnapshot();
+      this.update({snapshot, mutationError: null, error: null});
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        let snapshot = this.state.snapshot;
+        try {
+          snapshot = await this.api.loadSnapshot();
+        } catch {
+          // Preserve the last good state while still reporting the conflict.
+        }
+        this.update({
+          snapshot,
+          mutationError: "Конфликт ревизий: загружено актуальное состояние",
+        });
+        return;
+      }
+      this.update({mutationError: `Изменение не применено: ${errorMessage(error)}`});
     }
   }
 

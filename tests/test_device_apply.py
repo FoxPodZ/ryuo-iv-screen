@@ -63,6 +63,17 @@ def test_media_or_playback_change_is_one_coalesced_full_config():
     assert command.payload["waterBlockScreen"]["id"]["media"] == ["clip.mp4"]
 
 
+def test_rgb_and_thermal_settings_use_incremental_preset():
+    old = ScreenState()
+    new = replace(
+        old, rgb_mode="thermal", rgb_target="both",
+        thermal_source="gpu.temperature",
+    )
+    plan = plan_state_change(old, new)
+    assert plan.full_config is False
+    assert [command.resource for command in plan.commands] == [proto.RES_PRESET]
+
+
 def test_screen_state_payload_supports_two_independent_zones():
     state = ScreenState(
         screen_mode=proto.MODE_SPLIT,

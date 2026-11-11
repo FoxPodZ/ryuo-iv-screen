@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import ryuo_hid
@@ -188,7 +188,10 @@ def plan_state_change(old: ScreenState, new: ScreenState) -> ApplyPlan:
             proto.POST, proto.RES_TEMPERATURE, {"value": new.temperature_unit},
             priority=PRIORITY_STATE, coalesce_key="temperature", saved=True,
         ))
-    visual_fields = ("slots", "title_colors", "content_colors", "opacity")
+    visual_fields = (
+        "slots", "title_colors", "content_colors", "opacity",
+        "rgb_mode", "rgb_target", "thermal_source",
+    )
     if any(getattr(old, name) != getattr(new, name) for name in visual_fields):
         commands.append(DeviceCommand(
             proto.POST, proto.RES_PRESET, proto.preset_payload_from_state(new),
@@ -337,6 +340,7 @@ class DeviceWorker:
         self._next_keepalive: Optional[float] = None
         self._last_loop_clock: Optional[float] = None
         self._session_active = False
+        self._last_dynamic_preset: Optional[Mapping[str, Any]] = None
 
     def start(self) -> None:
         with self._condition:
@@ -523,6 +527,7 @@ class DeviceWorker:
     def _connect(self) -> None:
         with self._condition:
             self._phase = "connecting"
+            self._last_dynamic_preset = None
         self._transport.open()
         try:
             body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5,
@@ -664,12 +669,49 @@ class DeviceWorker:
                     self._phase = "degraded"
         self._send(proto.POST, proto.RES_ALL, payload, timeout=0)
         now = self._clock()
+        dynamic = self._dynamic_preset_payload(now)
+        if dynamic is not None and dynamic != self._last_dynamic_preset:
+            self._send(proto.POST, proto.RES_PRESET, dynamic, timeout=0)
+            self._last_dynamic_preset = copy.deepcopy(dynamic)
+        elif dynamic is None:
+            self._last_dynamic_preset = None
         with self._condition:
             self._last_heartbeat = now
             next_tick = ((self._next_keepalive or now) + self._keepalive_interval)
             self._next_keepalive = (now + self._keepalive_interval
                                     if next_tick < now else next_tick)
         return telemetry_ok
+
+    def _dynamic_preset_payload(self, now: float) -> Optional[Mapping[str, Any]]:
+        with self._condition:
+            state = self._desired_state
+            snapshot = self._latest_telemetry.snapshot
+        if state.rgb_mode == "off":
+            return None
+        if state.rgb_mode == "hue":
+            colour = proto.hsv_hex((float(now) % 10.0) / 10.0)
+        else:
+            if snapshot is None:
+                return None
+            reading = snapshot.measurements.get(state.thermal_source)
+            if (
+                reading is None or not reading.available
+                or not isinstance(reading.value, (int, float))
+                or isinstance(reading.value, bool)
+            ):
+                return None
+            colour = proto.thermal_hex(
+                float(reading.value), phase=bool(int(float(now)) % 2)
+            )
+        title = state.title_colors
+        content = state.content_colors
+        if state.rgb_target in ("title", "both"):
+            title = tuple(colour for _ in title)
+        if state.rgb_target in ("value", "both"):
+            content = tuple(colour for _ in content)
+        return proto.preset_payload_from_state(replace(
+            state, title_colors=title, content_colors=content
+        ))
 
     def _collect_telemetry(self) -> Mapping[str, Any]:
         if callable(self._telemetry):
@@ -680,7 +722,28 @@ class DeviceWorker:
                 )
         else:
             snapshot = self._telemetry.sample()
-            value = self._telemetry.to_pc_info(snapshot)
+            extra_readouts = {}
+            with self._condition:
+                slots = tuple(self._desired_state.slots)
+            for slot in slots:
+                reading = snapshot.measurements.get(slot.measurement_id)
+                if (
+                    slot.enabled
+                    and slot.label
+                    and slot.widget == "Fan Speed " + slot.label
+                    and slot.measurement_id.startswith("fan.")
+                    and reading is not None
+                    and reading.available
+                    and reading.unit == "RPM"
+                    and isinstance(reading.value, (int, float))
+                    and not isinstance(reading.value, bool)
+                ):
+                    extra_readouts[slot.label] = reading.value
+            value = (
+                self._telemetry.to_pc_info(snapshot, extra_readouts=extra_readouts)
+                if extra_readouts
+                else self._telemetry.to_pc_info(snapshot)
+            )
             catalog = tuple(self._telemetry.catalog())
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(snapshot, catalog, None)
