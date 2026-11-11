@@ -5,6 +5,7 @@ import type {ScreenPatchKind} from "../api";
 import type {
   ScreenStateDocument,
   SensorDescriptorDocument,
+  ScreenMutationOutcome,
   SlotAssignment,
   SnapshotDocument,
 } from "../api-types";
@@ -20,7 +21,7 @@ import "./sensor-slot";
 
 export interface ScreenController {
   ensureSensors(): Promise<void>;
-  patchScreen(kind: ScreenPatchKind, changes: Record<string, unknown>): Promise<void>;
+  patchScreen(kind: ScreenPatchKind, changes: Record<string, unknown>): Promise<ScreenMutationOutcome>;
 }
 
 const blankState = (): ScreenStateDocument => ({
@@ -194,7 +195,10 @@ export class ScreenPage extends LitElement {
     this.patchTimer = null;
     const pending = [...this.pending.entries()];
     this.pending.clear();
-    for (const [kind, changes] of pending) await this.controller.patchScreen(kind, changes);
+    for (const [kind, changes] of pending) {
+      const outcome = await this.controller.patchScreen(kind, changes);
+      if (!outcome.ok) break;
+    }
   }
 
   private onBrightness(event: Event): void {

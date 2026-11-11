@@ -82,7 +82,7 @@ const WIDGETS: Readonly<Record<string, string>> = Object.freeze({
   "gpu.load": "GPU Load",
   "gpu.usage": "GPU Usage",
   "gpu.temperature": "GPU Temperature",
-  "gpu.frequency": "GPU Speed",
+  "gpu.clock.core": "GPU Speed",
   "gpu.power": "GPU Power",
   "gpu.voltage": "GPU Voltage",
   "memory.load": "Memory Utilization",

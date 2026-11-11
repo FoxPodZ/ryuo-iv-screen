@@ -722,9 +722,10 @@ class DeviceWorker:
                 )
         else:
             snapshot = self._telemetry.sample()
-            extra_readouts = {}
             with self._condition:
                 slots = tuple(self._desired_state.slots)
+            catalog = tuple(self._telemetry.catalog())
+            aliases = {}
             for slot in slots:
                 reading = snapshot.measurements.get(slot.measurement_id)
                 if (
@@ -738,13 +739,24 @@ class DeviceWorker:
                     and isinstance(reading.value, (int, float))
                     and not isinstance(reading.value, bool)
                 ):
-                    extra_readouts[slot.label] = reading.value
-            value = (
-                self._telemetry.to_pc_info(snapshot, extra_readouts=extra_readouts)
-                if extra_readouts
-                else self._telemetry.to_pc_info(snapshot)
-            )
-            catalog = tuple(self._telemetry.catalog())
+                    descriptor = next((item for item in catalog if (
+                        item.measurement_id == slot.measurement_id
+                        and item.ref == reading.ref and item.unit == "RPM"
+                    )), None)
+                    if descriptor is not None:
+                        aliases[descriptor.label] = slot.label
+            value = self._telemetry.to_pc_info(snapshot)
+            if aliases and isinstance(value, Mapping):
+                fans = value.get("fans")
+                if isinstance(fans, list):
+                    renamed = []
+                    for fan in fans:
+                        item = dict(fan) if isinstance(fan, Mapping) else fan
+                        if isinstance(item, dict) and item.get("name") in aliases:
+                            item["name"] = aliases[item["name"]]
+                        renamed.append(item)
+                    value = dict(value)
+                    value["fans"] = renamed
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(snapshot, catalog, None)
         if not isinstance(value, Mapping):

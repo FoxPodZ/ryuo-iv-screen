@@ -4,6 +4,7 @@ import type {
   MutationResult,
   SensorDescriptorDocument,
   SensorsResponse,
+  ScreenMutationOutcome,
   SnapshotDocument,
 } from "./api-types";
 
@@ -157,16 +158,23 @@ export class AppStore {
   async patchScreen(
     kind: ScreenPatchKind,
     changes: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<ScreenMutationOutcome> {
     if (!this.api.patchState || !this.state.snapshot) {
-      this.update({mutationError: "Редактор ещё не получил текущее состояние"});
-      return;
+      const error = "Редактор ещё не получил текущее состояние";
+      this.update({mutationError: error});
+      return {ok: false, conflict: false, error};
     }
     const revision = this.state.snapshot.revision;
     try {
-      await this.api.patchState(kind, revision, changes);
+      const result = await this.api.patchState(kind, revision, changes);
       const snapshot = await this.api.loadSnapshot();
+      if (!result.saved || !result.queued || result.error) {
+        const error = result.error || "Состояние сохранено, но команда не поставлена в очередь";
+        this.update({snapshot, mutationError: error});
+        return {ok: false, conflict: false, error};
+      }
       this.update({snapshot, mutationError: null, error: null});
+      return {ok: true, conflict: false, error: null};
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         let snapshot = this.state.snapshot;
@@ -179,9 +187,15 @@ export class AppStore {
           snapshot,
           mutationError: "Конфликт ревизий: загружено актуальное состояние",
         });
-        return;
+        return {
+          ok: false,
+          conflict: true,
+          error: "Конфликт ревизий: загружено актуальное состояние",
+        };
       }
-      this.update({mutationError: `Изменение не применено: ${errorMessage(error)}`});
+      const message = `Изменение не применено: ${errorMessage(error)}`;
+      this.update({mutationError: message});
+      return {ok: false, conflict: false, error: message};
     }
   }
 

@@ -27,7 +27,7 @@ export class RyuoApp extends LitElement {
     .stream::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: #f26c83; }
     .stream.live::before { background: #5de2b0; }
     main { width: min(78rem, calc(100% - 2rem)); margin: 1.2rem auto 3rem; }
-    @media (max-width: 560px) { nav { display: none; } header { padding: .8rem 1rem; } main { width: min(100% - 1rem, 78rem); } }
+    @media (max-width: 560px) { header { padding: .8rem 1rem; flex-wrap: wrap; } nav { order: 3; width: 100%; } nav button { flex: 1; } main { width: min(100% - 1rem, 78rem); } }
   `;
 
   connectedCallback(): void {

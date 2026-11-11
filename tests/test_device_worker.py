@@ -4,6 +4,7 @@ import threading
 import time
 from dataclasses import replace
 
+import pytest
 import ryuo_proto as proto
 from ryuo_screen.device import DeviceCommand, DeviceWorker, LatestTelemetry
 from ryuo_screen.models import Measurement, SensorDescriptor, SensorRef, TelemetrySnapshot
@@ -99,8 +100,6 @@ def test_custom_fan_slot_label_gets_matching_keepalive_alias():
     }, 1.0)
 
     class StructuredTelemetry:
-        extra = None
-
         def sample(self):
             return snapshot
 
@@ -109,11 +108,10 @@ def test_custom_fan_slot_label_gets_matching_keepalive_alias():
 
         def to_pc_info(self, value, *, extra_readouts=None):
             assert value is snapshot
-            self.extra = extra_readouts
-            return proto.pc_info(fans=[
-                {"onBoard": True, "name": name, "value": int(reading)}
-                for name, reading in (extra_readouts or {}).items()
-            ])
+            assert extra_readouts is None
+            return proto.pc_info(fans=[{
+                "onBoard": True, "name": "AIO Pump", "value": 1830,
+            }])
 
     telemetry = StructuredTelemetry()
     slots = (
@@ -123,7 +121,6 @@ def test_custom_fan_slot_label_gets_matching_keepalive_alias():
 
     payload = worker._collect_telemetry()
 
-    assert telemetry.extra == {"Coolant": 1830}
     assert payload["fans"] == [
         {"onBoard": True, "name": "Coolant", "value": 1830}
     ]
@@ -146,6 +143,65 @@ def test_thermal_rgb_builds_incremental_preset_from_owner_snapshot():
 
     assert payload["settings"]["titleColor"] == proto.thermal_hex(70)
     assert payload["settings"]["contentColor"] == proto.thermal_hex(70)
+
+
+def test_six_long_fan_aliases_replace_originals_and_keep_all_frame_bounded():
+    measurements = {}
+    descriptors = []
+    slots = []
+    for index in range(6):
+        measurement_id = "fan.case{}.rpm".format(index)
+        ref = SensorRef("hwmon", "nct6799", "fan{}_input".format(index + 1))
+        measurements[measurement_id] = Measurement(
+            ref, measurement_id, 1000 + index, "RPM", 1.0, available=True
+        )
+        descriptors.append(SensorDescriptor(
+            ref, measurement_id, "Fan {}".format(index + 1), "RPM"
+        ))
+        label = "L{}".format(index) + "x" * 30
+        slots.append(SlotAssignment(
+            True, measurement_id, "Fan Speed " + label, label
+        ))
+    snapshot = TelemetrySnapshot(measurements, 1.0)
+
+    class StructuredTelemetry:
+        def sample(self):
+            return snapshot
+
+        def catalog(self):
+            return tuple(descriptors)
+
+        def to_pc_info(self, value, *, extra_readouts=None):
+            fans = [
+                {"onBoard": True, "name": descriptor.label,
+                 "value": int(value.measurements[descriptor.measurement_id].value)}
+                for descriptor in descriptors
+            ]
+            fans.extend(
+                {"onBoard": True, "name": name, "value": int(reading)}
+                for name, reading in (extra_readouts or {}).items()
+            )
+            return proto.pc_info(fans=fans, timestamp_ms=1)
+
+    worker = DeviceWorker(
+        FakeTransport(), StructuredTelemetry(),
+        state=ScreenState(slots=tuple(slots)),
+    )
+    payload = worker._collect_telemetry()
+
+    assert len(payload["fans"]) == 6
+    assert [fan["name"] for fan in payload["fans"]] == [slot.label for slot in slots]
+    DeviceCommand.for_state(ScreenState(slots=tuple(slots))).validated(
+        seq=2_147_483_647
+    )
+    proto.request(proto.POST, proto.RES_ALL, payload, seq=2_147_483_647)
+
+
+def test_fan_alias_longer_than_safe_protocol_bound_is_rejected():
+    with pytest.raises(ValueError, match="slot label must be at most 32"):
+        SlotAssignment(
+            True, "fan.case.rpm", "Fan Speed " + "x" * 33, "x" * 33
+        )
 
 
 def test_queue_is_bounded_and_equivalent_commands_coalesce():

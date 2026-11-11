@@ -4,6 +4,8 @@ import {customElement, property} from "lit/decorators.js";
 import type {SlotAssignment} from "../api-types";
 import type {SelectableSensor} from "../screen-model";
 
+const MAX_LABEL_LENGTH = 32;
+
 @customElement("sensor-slot")
 export class SensorSlot extends LitElement {
   @property({attribute: false}) assignment: SlotAssignment = {
@@ -49,7 +51,7 @@ export class SensorSlot extends LitElement {
         </label>
         ${selected?.userLabelCapable ? html`
           <label>Пользовательская подпись
-            <input name="slot_label" maxlength="48" .value=${this.assignment.label ?? selected.descriptor.label} @change=${this.onLabelChange}>
+            <input name="slot_label" maxlength="32" .value=${this.assignment.label ?? selected.descriptor.label} @change=${this.onLabelChange}>
           </label>
         ` : nothing}
         ${selected ? html`
@@ -95,27 +97,29 @@ export class SensorSlot extends LitElement {
     }
     const selected = this.options.find((item) => item.descriptor.measurementId === measurementId);
     if (!selected) return;
+    const label = selected.descriptor.label.slice(0, MAX_LABEL_LENGTH);
     this.emit("slot-change", {
       index: this.index,
       assignment: {
         enabled: true,
         measurement_id: measurementId,
         widget: selected.widget,
-        label: selected.userLabelCapable ? (this.assignment.label || selected.descriptor.label) : null,
+        label: selected.userLabelCapable ? label : null,
       } satisfies SlotAssignment,
     });
   }
 
   private onLabelChange(event: Event): void {
-    const label = (event.currentTarget as HTMLInputElement).value.trim();
+    const label = (event.currentTarget as HTMLInputElement).value.trim().slice(0, MAX_LABEL_LENGTH);
     const selected = this.options.find((item) => item.descriptor.measurementId === this.assignment.measurement_id);
     if (!selected?.userLabelCapable) return;
+    const fallback = selected.descriptor.label.slice(0, MAX_LABEL_LENGTH);
     this.emit("slot-change", {
       index: this.index,
       assignment: {
         ...this.assignment,
-        label: label || selected.descriptor.label,
-        widget: `Fan Speed ${label || selected.descriptor.label}`,
+        label: label || fallback,
+        widget: `Fan Speed ${label || fallback}`,
       },
     });
   }

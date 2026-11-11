@@ -20,6 +20,7 @@ from .models import SensorRef
 
 
 SCHEMA_VERSION = 1
+MAX_SLOT_LABEL_LENGTH = 32
 STATE_MODE = 0o640
 SECRET_MODE = 0o600
 _SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -214,6 +215,12 @@ class SlotAssignment:
         _string("slot widget", self.widget, allow_empty=True)
         if self.label is not None:
             _string("slot label", self.label)
+            if len(self.label) > MAX_SLOT_LABEL_LENGTH:
+                raise ValueError(
+                    "slot label must be at most {} characters".format(
+                        MAX_SLOT_LABEL_LENGTH
+                    )
+                )
         if self.enabled and (not self.measurement_id or not self.widget):
             raise ValueError("enabled slot requires measurement_id and widget")
 

@@ -43,6 +43,12 @@ export interface MutationResult {
   error: string | null;
 }
 
+export interface ScreenMutationOutcome {
+  ok: boolean;
+  conflict: boolean;
+  error: string | null;
+}
+
 export interface ScreenStateDocument {
   schema_version: number;
   revision: number;

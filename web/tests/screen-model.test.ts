@@ -83,14 +83,18 @@ describe("screen model", () => {
   it("excludes unsupported measurements and marks fan user-label capability", () => {
     const options = selectableSensors([
       sensor("cpu.temperature"),
+      sensor("gpu.clock.core", "MHz"),
+      sensor("gpu.frequency", "MHz"),
       sensor("gpu.vram.used", "B"),
       sensor("fan.aio.rpm", "RPM", false),
     ]);
     expect(options.map((item) => item.descriptor.measurementId)).toEqual([
       "cpu.temperature",
+      "gpu.clock.core",
       "fan.aio.rpm",
     ]);
-    expect(options[1]).toMatchObject({userLabelCapable: true, available: false});
+    expect(options[1].widget).toBe("GPU Speed");
+    expect(options[2]).toMatchObject({userLabelCapable: true, available: false});
     expect(options[0].userLabelCapable).toBe(false);
   });
 

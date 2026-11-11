@@ -35,6 +35,7 @@ class FakeApi implements ApiGateway {
   loginCalls: string[] = [];
   patchCalls: Array<{kind: ScreenPatchKind; revision: number; changes: Record<string, unknown>}> = [];
   patchError: ApiError | null = null;
+  mutationResult: MutationResult | null = null;
 
   async authStatus(): Promise<AuthStatus> { return this.auth; }
   async loadSnapshot(): Promise<SnapshotDocument> { return this.current; }
@@ -51,7 +52,7 @@ class FakeApi implements ApiGateway {
     this.patchCalls.push({kind, revision, changes});
     if (this.patchError) throw this.patchError;
     this.current = snapshot(revision + 1, typeof changes.brightness === "number" ? changes.brightness : this.current.state.brightness);
-    return {revision: revision + 1, saved: true, queued: true, applied: false, acked: false, error: null};
+    return this.mutationResult ?? {revision: revision + 1, saved: true, queued: true, applied: false, acked: false, error: null};
   }
 }
 
@@ -239,9 +240,26 @@ describe("AppStore", () => {
 
     api.current = snapshot(3, 77);
     api.patchError = new ApiError(409, "revision_conflict", "stale");
-    await store.patchScreen("screen", {opacity: 50});
+    const outcome = await store.patchScreen("screen", {opacity: 50});
+    expect(outcome).toMatchObject({ok: false, conflict: true});
     expect(store.value.snapshot?.revision).toBe(3);
     expect(store.value.snapshot?.state.brightness).toBe(77);
     expect(store.value.mutationError).toContain("Конфликт ревизий");
+  });
+
+  it("returns a failed mutation outcome when the device did not queue saved state", async () => {
+    const api = new FakeApi();
+    api.mutationResult = {
+      revision: 2, saved: true, queued: false, applied: false,
+      acked: false, error: "device queue is full",
+    };
+    const store = new AppStore(api, new ManualConnector());
+    await store.start();
+
+    const outcome = await store.patchScreen("brightness", {brightness: 44});
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("device queue is full");
+    expect(store.value.mutationError).toContain("device queue is full");
   });
 });
