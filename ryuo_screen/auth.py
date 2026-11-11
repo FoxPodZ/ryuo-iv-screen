@@ -212,6 +212,18 @@ class SessionStore:
         with self._lock:
             self._sessions.pop(token, None)
 
+    def remaining(self, session: Session) -> float:
+        """Return the truthful remaining lifetime for a still-active session."""
+        if not isinstance(session, Session):
+            raise TypeError("session must be a Session")
+        now = float(self._clock())
+        with self._lock:
+            self._prune_locked(now)
+            current = self._sessions.get(session.token)
+            if current is None or current != session:
+                return 0.0
+            return max(0.0, current.expires_at - now)
+
     def diagnostics(self) -> Dict[str, int]:
         now = float(self._clock())
         with self._lock:
@@ -569,7 +581,11 @@ async def security_middleware(request: web.Request, handler):
         "/api/v1/auth/login",
         "/api/v1/auth/status",
     )
-    if public:
+    public_static = (
+        request.method in ("GET", "HEAD")
+        and (request.path == "/" or request.path.startswith("/assets/"))
+    )
+    if public or public_static:
         return await handler(request)
     if session is None:
         return _json_error(401, "authentication_required", "authentication is required")
@@ -596,6 +612,7 @@ async def auth_status(request: web.Request) -> web.Response:
             "required": True,
             "authenticated": session is not None,
             "csrfToken": session.csrf_token if session is not None else None,
+            "expiresIn": policy.sessions.remaining(session) if session is not None else 0.0,
         }
     )
 
@@ -626,7 +643,7 @@ async def auth_login(request: web.Request) -> web.Response:
             "required": True,
             "authenticated": True,
             "csrfToken": session.csrf_token,
-            "expiresIn": int(policy.sessions.lifetime),
+            "expiresIn": policy.sessions.remaining(session),
         }
     )
     response.set_cookie(

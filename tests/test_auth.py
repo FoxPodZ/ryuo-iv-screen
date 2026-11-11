@@ -69,8 +69,13 @@ def test_sessions_rotate_expire_and_keep_only_a_bounded_set():
     assert sessions.get(rotated.token) == rotated
     assert rotated.token != second.token
     assert rotated.csrf_token != second.csrf_token
+    assert sessions.remaining(rotated) == pytest.approx(10.0)
+
+    clock.value += 3.25
+    assert sessions.remaining(rotated) == pytest.approx(6.75)
 
     sessions.logout(rotated.token)
+    assert sessions.remaining(rotated) == 0.0
     assert sessions.get(rotated.token) is None
 
     clock.value += 11.0

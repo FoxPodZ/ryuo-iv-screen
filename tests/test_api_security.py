@@ -250,6 +250,72 @@ async def test_lan_login_session_csrf_expiry_and_cookie_attributes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_lan_static_shell_is_public_but_api_and_mutations_stay_protected(tmp_path):
+    policy = _lan_policy()
+    client, context, device = await _client(tmp_path, policy)
+    web_root = tmp_path / "dist"
+    (web_root / "assets").mkdir(parents=True)
+    (web_root / "index.html").write_text("<html>login shell</html>", encoding="utf-8")
+    (web_root / "assets" / "index-AbC123xy.js").write_text("login()", encoding="utf-8")
+    context.web_root = web_root
+    common = {
+        "Host": "192.168.1.50",
+        "Origin": "http://192.168.1.50",
+        "X-Forwarded-For": "192.168.1.70",
+    }
+    try:
+        index = await client.get("/", headers=common)
+        index_text = await index.text()
+        head = await client.head("/", headers=common)
+        asset = await client.get("/assets/index-AbC123xy.js", headers=common)
+        asset_text = await asset.text()
+        other = await client.get("/not-a-static-asset", headers=common)
+        state = await client.get("/api/v1/state", headers=common)
+        mutation = await client.patch(
+            "/api/v1/brightness",
+            headers={**common, "If-Match": "1"},
+            json={"brightness": 50},
+        )
+    finally:
+        await client.close()
+
+    assert index.status == 200 and index_text == "<html>login shell</html>"
+    assert head.status == 200
+    assert asset.status == 200 and asset_text == "login()"
+    assert other.status == 401
+    assert state.status == 401
+    assert mutation.status == 401
+    assert context.state.revision == 1
+    assert device.commands == []
+
+
+@pytest.mark.asyncio
+async def test_auth_status_reports_truthful_remaining_session_lifetime(tmp_path):
+    now = [100.0]
+    policy = _lan_policy(clock=lambda: now[0])
+    client, _, _ = await _client(tmp_path, policy)
+    common = {
+        "Host": "192.168.1.50",
+        "Origin": "http://192.168.1.50",
+        "X-Forwarded-For": "192.168.1.70",
+    }
+    try:
+        login = await client.post(
+            "/api/v1/auth/login", headers=common, json={"password": "secret-password"}
+        )
+        login_body = await login.json()
+        initial = await (await client.get("/api/v1/auth/status", headers=common)).json()
+        now[0] += 3.25
+        later = await (await client.get("/api/v1/auth/status", headers=common)).json()
+    finally:
+        await client.close()
+
+    assert login_body["expiresIn"] == pytest.approx(10.0)
+    assert initial["expiresIn"] == pytest.approx(10.0)
+    assert later["expiresIn"] == pytest.approx(6.75)
+
+
+@pytest.mark.asyncio
 async def test_login_rotates_existing_session_and_logout_invalidates_it(tmp_path):
     policy = _lan_policy()
     client, _, _ = await _client(tmp_path, policy)

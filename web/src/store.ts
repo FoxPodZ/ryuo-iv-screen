@@ -33,6 +33,7 @@ export interface EventConnector {
 
 type Listener = (value: Readonly<AppView>) => void;
 type Scheduler = (run: () => void, delay: number) => unknown;
+type ScheduleCanceller = (handle: unknown) => void;
 
 const deepFreeze = <T>(value: T): T => {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -63,11 +64,14 @@ export class AppStore {
   private connection: EventConnection | null = null;
   private retryToken = 0;
   private stopped = false;
+  private sessionTimer: unknown | null = null;
+  private sessionGeneration = 0;
 
   constructor(
     private readonly api: ApiGateway,
     private readonly events: EventConnector,
     private readonly schedule: Scheduler = (run, delay) => window.setTimeout(run, delay),
+    private readonly cancelSchedule: ScheduleCanceller = (handle) => window.clearTimeout(handle as number),
   ) {}
 
   get value(): Readonly<AppView> { return this.state; }
@@ -85,18 +89,19 @@ export class AppStore {
 
   async start(): Promise<void> {
     this.stopped = false;
+    this.clearSessionExpiry();
     this.connection?.close();
     this.connection = null;
     this.update({phase: "loading", error: null, connected: false});
     try {
       const auth = await this.api.authStatus();
-      this.api.setCsrfToken?.(auth.csrfToken);
-      this.update({auth, csrfToken: auth.csrfToken});
+      const authActive = this.applyAuth(auth);
       if (auth.required && !auth.authenticated) {
         this.update({phase: "login"});
         return;
       }
-      await this.loadAndConnect();
+      if (!authActive) return;
+      await this.loadAndConnect(this.sessionGeneration);
     } catch (error) {
       this.handleLoadError(error);
     }
@@ -105,6 +110,7 @@ export class AppStore {
   stop(): void {
     this.stopped = true;
     this.retryToken += 1;
+    this.clearSessionExpiry();
     this.connection?.close();
     this.connection = null;
     this.update({connected: false});
@@ -114,22 +120,24 @@ export class AppStore {
     this.update({error: null});
     try {
       const auth = await this.api.login(password);
-      this.api.setCsrfToken?.(auth.csrfToken);
-      this.update({auth, csrfToken: auth.csrfToken, phase: "loading"});
-      await this.loadAndConnect();
+      if (!this.applyAuth(auth)) return;
+      this.update({phase: "loading"});
+      await this.loadAndConnect(this.sessionGeneration);
     } catch (error) {
       this.handleLoadError(error, true);
     }
   }
 
-  private async loadAndConnect(): Promise<void> {
+  private async loadAndConnect(generation: number): Promise<void> {
     const snapshot = await this.api.loadSnapshot();
+    if (this.stopped || generation !== this.sessionGeneration) return;
     this.update({phase: "ready", snapshot, error: null});
     this.openEvents();
   }
 
   private handleLoadError(error: unknown, loginAttempt = false): void {
     if (error instanceof ApiError && error.status === 401) {
+      this.clearSessionExpiry();
       this.connection?.close();
       this.connection = null;
       this.update({
@@ -145,6 +153,47 @@ export class AppStore {
       phase: loginAttempt ? "login" : "error",
       connected: false,
       error: errorMessage(error),
+    });
+  }
+
+  private applyAuth(auth: AuthStatus): boolean {
+    this.clearSessionExpiry();
+    this.api.setCsrfToken?.(auth.csrfToken);
+    this.update({auth, csrfToken: auth.csrfToken});
+    if (!auth.required || !auth.authenticated) return true;
+    const seconds = auth.expiresIn;
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+      this.expireSession(this.sessionGeneration);
+      return false;
+    }
+    const generation = this.sessionGeneration;
+    this.sessionTimer = this.schedule(
+      () => this.expireSession(generation),
+      seconds * 1000,
+    );
+    return true;
+  }
+
+  private clearSessionExpiry(): void {
+    this.sessionGeneration += 1;
+    if (this.sessionTimer !== null) this.cancelSchedule(this.sessionTimer);
+    this.sessionTimer = null;
+  }
+
+  private expireSession(generation: number): void {
+    if (this.stopped || generation !== this.sessionGeneration) return;
+    this.sessionGeneration += 1;
+    this.sessionTimer = null;
+    this.retryToken += 1;
+    this.connection?.close();
+    this.connection = null;
+    this.api.setCsrfToken?.(null);
+    this.update({
+      phase: "login",
+      auth: {required: true, authenticated: false, csrfToken: null, expiresIn: 0},
+      csrfToken: null,
+      connected: false,
+      error: "Сессия истекла. Войдите снова.",
     });
   }
 

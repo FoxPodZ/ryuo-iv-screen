@@ -39,7 +39,7 @@ class FakeApi implements ApiGateway {
   async login(password: string): Promise<AuthStatus> {
     this.loginCalls.push(password);
     if (password === "bad") throw new ApiError(401, "invalid_credentials", "Неверный пароль");
-    this.auth = {required: true, authenticated: true, csrfToken: "csrf"};
+    this.auth = {required: true, authenticated: true, csrfToken: "csrf", expiresIn: 10};
     return this.auth;
   }
 }
@@ -154,5 +154,66 @@ describe("AppStore", () => {
     expect(store.value.phase).toBe("login");
     expect(store.value.error).toBe("Неверный пароль");
     expect(JSON.stringify(store.value)).not.toContain('"bad"');
+  });
+
+  it("expires a LAN session on schedule even while SSE remains healthy", async () => {
+    const api = new FakeApi();
+    api.auth = {required: true, authenticated: true, csrfToken: "csrf", expiresIn: 2};
+    const stream = new ManualConnector();
+    const scheduled: Array<{delay: number; run: () => void; cancelled: boolean}> = [];
+    const store = new AppStore(
+      api,
+      stream,
+      (run, delay) => {
+        const entry = {delay, run, cancelled: false};
+        scheduled.push(entry);
+        return entry;
+      },
+      (handle) => { (handle as {cancelled: boolean}).cancelled = true; },
+    );
+    await store.start();
+    expect(store.value.phase).toBe("ready");
+    expect(scheduled[0].delay).toBe(2000);
+
+    scheduled[0].run();
+    expect(store.value.phase).toBe("login");
+    expect(store.value.csrfToken).toBeNull();
+    expect(store.value.snapshot?.revision).toBe(1);
+    expect(store.value.error).toContain("истекла");
+  });
+
+  it("invalidates old expiry timers on relogin, stop and local mode", async () => {
+    const api = new FakeApi();
+    api.auth = {required: true, authenticated: true, csrfToken: "old", expiresIn: 1};
+    const stream = new ManualConnector();
+    const scheduled: Array<{delay: number; run: () => void; cancelled: boolean}> = [];
+    const store = new AppStore(
+      api,
+      stream,
+      (run, delay) => {
+        const entry = {delay, run, cancelled: false};
+        scheduled.push(entry);
+        return entry;
+      },
+      (handle) => { (handle as {cancelled: boolean}).cancelled = true; },
+    );
+    await store.start();
+    const old = scheduled[0];
+    await store.login("new-secret");
+    expect(old.cancelled).toBe(true);
+    old.run();
+    expect(store.value.phase).toBe("ready");
+
+    const current = scheduled[1];
+    store.stop();
+    expect(current.cancelled).toBe(true);
+    current.run();
+    expect(store.value.phase).toBe("ready");
+
+    const localApi = new FakeApi();
+    const localScheduled = vi.fn();
+    const localStore = new AppStore(localApi, new ManualConnector(), localScheduled);
+    await localStore.start();
+    expect(localScheduled).not.toHaveBeenCalled();
   });
 });

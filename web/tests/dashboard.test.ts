@@ -96,4 +96,16 @@ describe("dashboard-page", () => {
     expect(element.shadowRoot?.textContent).toContain("Загрузка");
     element.remove();
   });
+
+  it("renders an actionable initial error instead of an endless loading state", async () => {
+    const element = window.document.createElement("dashboard-page") as HTMLElement & {view: AppView; updateComplete: Promise<unknown>};
+    element.view = view(null, "error", "API недоступен");
+    window.document.body.append(element);
+    await element.updateComplete;
+    const alert = element.shadowRoot?.querySelector("[role='alert']");
+    expect(alert?.textContent).toContain("API недоступен");
+    expect(alert?.textContent).toContain("Повторите");
+    expect(element.shadowRoot?.textContent).not.toContain("Загрузка телеметрии");
+    element.remove();
+  });
 });

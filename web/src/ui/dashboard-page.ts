@@ -41,6 +41,9 @@ export class DashboardPage extends LitElement {
     :host { display: block; color: var(--ink, #f5f7fb); }
     .notice { margin: 0 0 1rem; padding: .8rem 1rem; border: 1px solid #eb5c9a66; border-radius: .8rem; background: #eb5c9a16; color: #ffc8df; }
     .loading { min-height: 40vh; display: grid; place-items: center; color: #a9b3c4; letter-spacing: .08em; text-transform: uppercase; }
+    .error-state { min-height: 40vh; display: grid; place-content: center; gap: .6rem; text-align: center; }
+    .error-state h1 { color: #ffc2d8; }
+    .error-state p { color: #a9b3c4; }
     .hero { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(15rem, .65fr); gap: 1rem; margin-bottom: 1rem; }
     .panel { border: 1px solid #ffffff12; border-radius: 1rem; padding: 1.2rem; background: linear-gradient(145deg, #171b27e8, #0e111aee); box-shadow: 0 1rem 3rem #0006; }
     .device { position: relative; overflow: hidden; }
@@ -68,6 +71,13 @@ export class DashboardPage extends LitElement {
 
   protected render() {
     const snapshot = this.view?.snapshot;
+    if (!snapshot && this.view?.phase === "error") return html`
+      <section class="panel error-state" role="alert">
+        <h1>Не удалось загрузить Dashboard</h1>
+        <p>${this.view.error || "API недоступен"}</p>
+        <p>Повторите попытку или проверьте состояние службы ryuo-screen.</p>
+      </section>
+    `;
     if (!snapshot) return html`<div class="loading" role="status">Загрузка телеметрии…</div>`;
     const {device, state, telemetry} = snapshot;
     return html`
