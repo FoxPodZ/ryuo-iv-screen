@@ -50,15 +50,23 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from urllib.parse import quote
 
-import hid
 import ryuo_hid
 import ryuo_proto as proto
+from ryuo_screen.client import (
+    API_PREFIX, ApiError, ServiceUnavailable, UnixApiClient, add_service_options,
+    direct_device, patch_state, print_state_result, slots_for_items,
+)
+from ryuo_screen.media import MediaCatalog
+from ryuo_screen.ownership import OwnershipError
 
 VID, PID = proto.VID, proto.PID
 
 
 def open_dev(vid: int | None = None, pid: int = PID, index: int | None = None):
+    import hid
+
     # vid=None means "any vendor id with this product id" -- see proto.VIDS.
     devs = proto.find_devices(hid, vid, pid)
     if not devs:
@@ -148,6 +156,88 @@ def conn(h, seq: int = 1) -> dict:
     return info
 
 
+def _print_media(custom, preset) -> None:
+    for kind, names in (("custom", custom), ("preset", preset)):
+        print(f"{kind} ({len(names)}):")
+        for name in names:
+            print(f"  {name}")
+
+
+def _service_path(cmd, rest):
+    if cmd in ("brightness", "items") or (cmd == "get" and (not rest or rest[0] == "config")):
+        return "/state"
+    if cmd == "info" and "--serial" not in rest:
+        return "/device"
+    if cmd in ("ls", "rm"):
+        return "/media"
+    return None
+
+
+def _run_service(client, cmd, rest, document) -> None:
+    if cmd in ("get", "info"):
+        print(json.dumps(document, indent=2))
+    elif cmd == "brightness":
+        result = patch_state(client, document, "/brightness", brightness=_brightness(rest))
+        print_state_result(result)
+    elif cmd == "items":
+        slots = slots_for_items(proto.sysinfo_slots(*_items(rest)), client)
+        print_state_result(patch_state(client, document, "/screen", slots=slots))
+    else:
+        try:
+            catalog = MediaCatalog(factory=document.get("factory"),
+                                   custom=document.get("custom"))
+        except TypeError as exc:
+            raise ApiError(f"Ryuo service returned an invalid media listing: {exc}") from exc
+        if cmd == "ls":
+            _print_media(catalog.custom, catalog.factory)
+        else:
+            _delete_service_media(client, catalog, _media_delete(rest))
+
+
+def _delete_service_media(client, catalog, payload) -> None:
+    if "exclude" in payload:
+        names = [name for name in catalog.custom
+                 if name not in payload["exclude"] and catalog.classify(name) == "custom"]
+    else:
+        names = payload["include"]
+    for name in names:
+        proto.check_media_name(name)
+        if catalog.classify(name) != "custom":
+            raise DeviceError(f"{name!r} is not listed as custom media")
+    for name in dict.fromkeys(names):
+        result = client.request("DELETE", API_PREFIX + "/media/" + quote(name, safe=""))
+        print(json.dumps(result))
+        if (result.get("error") or result.get("confirmed") is not True
+                or result.get("applied") is not True):
+            raise DeviceError(result.get("error") or f"deletion of {name!r} was not confirmed")
+
+
+def _brightness(rest) -> int:
+    if not rest:
+        sys.exit("usage: brightness <value>   (0-102; the value is "
+                 "scaled ~2.5x into a kernel backlight that clamps at "
+                 "255, so 100 is only ~98% of max and 102 is full)")
+    return int(rest[0])
+
+
+def _items(rest):
+    if not rest:
+        sys.exit("usage: items <name> [name ...]   (up to 6)")
+    return list(rest)
+
+
+def _media_delete(rest):
+    if not rest or rest == ["--except"]:
+        sys.exit("usage: rm <name> [name ...]          delete these\n"
+                 "       rm --except <name> [name ...] delete every "
+                 "OTHER file in pcMedia/\n"
+                 "  only ever touches /sdcard/pcMedia/, never the "
+                 "presets")
+    if rest[0] == "--except":
+        return proto.media_delete_payload(exclude=rest[1:])
+    return proto.media_delete_payload(include=list(rest))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="single-shot request/response tool for the Ryuo IV screen",
@@ -158,20 +248,24 @@ def main() -> None:
     ap.add_argument("--vid", type=lambda x: int(x, 0), default=None,
                     help="pin a vendor id; default accepts any (it changes "
                          "between firmware versions)")
-    ap.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
+    ap.add_argument("--pid", type=lambda x: int(x, 0))
     ap.add_argument("--index", type=int, default=None,
                     help="which enumerated interface to open (see --list)")
     ap.add_argument("--list", action="store_true",
                     help="list enumerated interfaces and exit")
+    add_service_options(ap)
     ap.add_argument("argv", nargs=argparse.REMAINDER,
                     help="command and its arguments")
     args = ap.parse_args()
+    pid = PID if args.pid is None else args.pid
 
     if args.list:
-        found = proto.find_devices(hid, args.vid, args.pid)
+        import hid
+
+        found = proto.find_devices(hid, args.vid, pid)
         if not found:
-            ids = (f"{args.vid:04X}:{args.pid:04X}" if args.vid
-                   else f"any vendor with product {args.pid:04X}")
+            ids = (f"{args.vid:04X}:{pid:04X}" if args.vid
+                   else f"any vendor with product {pid:04X}")
             print(f"nothing enumerating as {ids}")
         for i, d in enumerate(found):
             print(f"[{i}] usage_page={d.get('usage_page'):#06x} "
@@ -184,86 +278,80 @@ def main() -> None:
         sys.exit(1)
     cmd, rest = args.argv[0], args.argv[1:]
 
-    h = open_dev(args.vid, args.pid, args.index)
+    path = _service_path(cmd, rest)
     try:
-        if cmd == "get":
-            txn(h, proto.GET, rest[0] if rest else "config")
-        elif cmd == "brightness":
-            if not rest:
-                sys.exit("usage: brightness <value>   (0-102; the value is "
-                         "scaled ~2.5x into a kernel backlight that clamps at "
-                         "255, so 100 is only ~98% of max and 102 is full)")
-            txn(h, proto.POST, proto.RES_BRIGHTNESS, {"value": int(rest[0])})
-        elif cmd == "rotate":
-            if not rest:
-                sys.exit("usage: rotate <degrees>   (0, 90, 180, 270)\n"
-                         "  NOTE: dead resource. Writes a system property that\n"
-                         "  nothing reads; the panel does not rotate. Kept for\n"
-                         "  re-testing on future firmware.")
-            txn(h, proto.POST, proto.RES_ROTATE, {"degree": int(rest[0])})
-            print("\nNOTE: THIS DOES NOT ROTATE ANYTHING. It sets")
-            print("persist.vendor.orientation and nothing else. The property")
-            print("is written and survives a reboot -- confirmed on fw 1.0.10 --")
-            print("but nothing on the device reads it and the panel never turns.")
-            print("Orientation comes from the read-only build property")
-            print("ro.surface_flinger.primary_display_orientation, which cannot")
-            print("be changed at runtime. The command is kept only so the result")
-            print("can be re-checked on future firmware.")
-        elif cmd == "items":
-            if not rest:
-                sys.exit("usage: items <name> [name ...]   (up to 6)")
-            txn(h, proto.POST, proto.RES_SYSINFO_DISPLAY, {"items": list(rest)})
-        elif cmd in ("info", "ls"):
-            info = conn(h)
-            if cmd == "ls":
-                media = info.get("media") or {}
-                for kind in ("custom", "preset"):
-                    names = media.get(kind) or []
-                    print(f"{kind} ({len(names)}):")
-                    for n in names:
-                        print(f"  {n}")
+        if path is not None and not args.direct and all(
+            value is None for value in (args.vid, args.pid, args.index)
+        ):
+            client = UnixApiClient(args.socket)
+            try:
+                document = client.request("GET", API_PREFIX + path)
+            except ServiceUnavailable:
+                pass
             else:
-                # The reply carries the unit's serial number. Output from
-                # this tool ends up pasted into issues, so it stays blank
-                # unless asked for.
-                print(json.dumps(info if "--serial" in rest
-                                 else proto.redact_conn(info), indent=2))
-        elif cmd == "rm":
-            if not rest or rest == ["--except"]:
-                sys.exit("usage: rm <name> [name ...]          delete these\n"
-                         "       rm --except <name> [name ...] delete every "
-                         "OTHER file in pcMedia/\n"
-                         "  only ever touches /sdcard/pcMedia/, never the "
-                         "presets")
-            if rest[0] == "--except":
-                payload = proto.media_delete_payload(exclude=rest[1:])
-            else:
-                payload = proto.media_delete_payload(include=list(rest))
-            txn(h, proto.POST, proto.RES_MEDIA_DELETE, payload)
-        elif cmd == "raw":
-            if len(rest) < 2:
-                sys.exit('usage: raw <METHOD> <resource> [json]\n'
-                         '  e.g. raw POST temperature \'{"value":"Celsius"}\'')
-            method, resource = rest[0], rest[1]
-            if resource == proto.RES_UPGRADE:
-                sys.exit("refusing to send `upgrade`: it starts an update in "
-                         "RKUpdateService, and nothing in this repo goes near "
-                         "the OTA path (PROTOCOL.md §11). If you really need "
-                         "it, edit this file -- it's one line.")
-            payload = json.loads(rest[2]) if len(rest) > 2 else None
-            if (resource == proto.RES_TRANSPORT and isinstance(payload, dict)
-                    and payload.get("type") == "firmware"):
-                sys.exit('refusing `transport` with type "firmware": the '
-                         "matching `transported` asks RKUpdateService to look "
-                         "for an update package. Same reason as `upgrade`.")
-            txn(h, method, resource, payload)
-        else:
-            sys.exit(f"unknown command {cmd!r} — try: get, brightness, "
-                     f"rotate, items, info, ls, rm, raw")
-    except (DeviceError, ValueError) as ex:
+                _run_service(client, cmd, rest, document)
+                return
+        with direct_device(args.socket, open_dev, args.vid, pid, args.index) as h:
+            _run_direct(h, cmd, rest)
+    except (ApiError, DeviceError, OwnershipError, ValueError) as ex:
         sys.exit(f"error: {ex}")
-    finally:
-        h.close()
+
+
+def _run_direct(h, cmd, rest) -> None:
+    if cmd == "get":
+        txn(h, proto.GET, rest[0] if rest else "config")
+    elif cmd == "brightness":
+        txn(h, proto.POST, proto.RES_BRIGHTNESS, {"value": _brightness(rest)})
+    elif cmd == "rotate":
+        if not rest:
+            sys.exit("usage: rotate <degrees>   (0, 90, 180, 270)\n"
+                     "  NOTE: dead resource. Writes a system property that\n"
+                     "  nothing reads; the panel does not rotate. Kept for\n"
+                     "  re-testing on future firmware.")
+        txn(h, proto.POST, proto.RES_ROTATE, {"degree": int(rest[0])})
+        print("\nNOTE: THIS DOES NOT ROTATE ANYTHING. It sets")
+        print("persist.vendor.orientation and nothing else. The property")
+        print("is written and survives a reboot -- confirmed on fw 1.0.10 --")
+        print("but nothing on the device reads it and the panel never turns.")
+        print("Orientation comes from the read-only build property")
+        print("ro.surface_flinger.primary_display_orientation, which cannot")
+        print("be changed at runtime. The command is kept only so the result")
+        print("can be re-checked on future firmware.")
+    elif cmd == "items":
+        txn(h, proto.POST, proto.RES_SYSINFO_DISPLAY, {"items": _items(rest)})
+    elif cmd in ("info", "ls"):
+        info = conn(h)
+        if cmd == "ls":
+            media = info.get("media") or {}
+            _print_media(media.get("custom") or [], media.get("preset") or [])
+        else:
+            # The reply carries the unit's serial number. Output from
+            # this tool ends up pasted into issues, so it stays blank
+            # unless asked for.
+            print(json.dumps(info if "--serial" in rest
+                             else proto.redact_conn(info), indent=2))
+    elif cmd == "rm":
+        txn(h, proto.POST, proto.RES_MEDIA_DELETE, _media_delete(rest))
+    elif cmd == "raw":
+        if len(rest) < 2:
+            sys.exit('usage: raw <METHOD> <resource> [json]\n'
+                     '  e.g. raw POST temperature \'{"value":"Celsius"}\'')
+        method, resource = rest[0], rest[1]
+        if resource == proto.RES_UPGRADE:
+            sys.exit("refusing to send `upgrade`: it starts an update in "
+                     "RKUpdateService, and nothing in this repo goes near "
+                     "the OTA path (PROTOCOL.md §11). If you really need "
+                     "it, edit this file -- it's one line.")
+        payload = json.loads(rest[2]) if len(rest) > 2 else None
+        if (resource == proto.RES_TRANSPORT and isinstance(payload, dict)
+                and payload.get("type") == "firmware"):
+            sys.exit('refusing `transport` with type "firmware": the '
+                     "matching `transported` asks RKUpdateService to look "
+                     "for an update package. Same reason as `upgrade`.")
+        txn(h, method, resource, payload)
+    else:
+        sys.exit(f"unknown command {cmd!r} — try: get, brightness, "
+                 f"rotate, items, info, ls, rm, raw")
 
 
 if __name__ == "__main__":

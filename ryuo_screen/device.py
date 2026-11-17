@@ -13,6 +13,7 @@ import ryuo_hid
 import ryuo_proto as proto
 
 from .models import CommandResult, SensorDescriptor, TelemetrySnapshot
+from .ownership import DeviceOwnership
 from .store import ScreenState
 
 
@@ -296,6 +297,7 @@ class DeviceWorker:
         queue_size: int = 64,
         clock: Callable[[], float] = _boottime,
         resume_gap_seconds: float = 5.0,
+        ownership: Optional[DeviceOwnership] = None,
     ) -> None:
         if keepalive_interval <= 0 or settle_seconds < 0 or max_rate <= 0:
             raise ValueError("worker timing values are invalid")
@@ -304,6 +306,9 @@ class DeviceWorker:
         if not reconnect_backoff or any(value < 0 for value in reconnect_backoff):
             raise ValueError("reconnect_backoff must contain non-negative delays")
         self._transport = transport
+        self._ownership = ownership
+        if self._ownership is None and isinstance(transport, HidTransport):
+            self._ownership = DeviceOwnership()
         self._telemetry = telemetry
         self._desired_state = state or ScreenState()
         self._applied_state = self._desired_state
@@ -345,15 +350,24 @@ class DeviceWorker:
 
     def start(self) -> None:
         with self._condition:
-            if self._thread is not None and self._thread.is_alive():
+            if self._thread is not None:
                 return
-            self._stop = False
-            self._phase = "disconnected"
-            self._started_at = self._clock()
-            self._thread = threading.Thread(
-                target=self._run, name="ryuo-device", daemon=True
-            )
-            self._thread.start()
+            if self._ownership is not None:
+                self._ownership.acquire()
+            try:
+                self._stop = False
+                self._phase = "disconnected"
+                self._started_at = self._clock()
+                self._thread = threading.Thread(
+                    target=self._run, name="ryuo-device", daemon=True
+                )
+                self._thread.start()
+            except Exception:
+                self._thread = None
+                self._phase = "stopped"
+                if self._ownership is not None:
+                    self._ownership.release()
+                raise
 
     def stop(self, timeout: float = 5.0) -> None:
         with self._condition:
@@ -366,7 +380,10 @@ class DeviceWorker:
         if thread.is_alive():
             raise TimeoutError("device worker did not stop")
         with self._condition:
-            self._thread = None
+            if self._thread is thread:
+                if self._ownership is not None:
+                    self._ownership.release()
+                self._thread = None
 
     def notify_resume(self) -> None:
         """Wake immediately after resume/udev and force a fresh handshake."""

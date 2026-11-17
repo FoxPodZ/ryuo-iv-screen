@@ -42,10 +42,14 @@ import sys
 import threading
 import time
 
-import hid
-
 import ryuo_hid
 import ryuo_proto as proto
+from ryuo_screen.client import (
+    API_PREFIX, ApiError, ServiceUnavailable, UnixApiClient, add_service_options,
+    direct_device, patch_state, print_state_result, slots_for_items,
+)
+from ryuo_screen.ownership import OwnershipError
+from ryuo_screen.store import ScreenState
 from ryuo_screen.telemetry.amd import AmdGpuProvider
 from ryuo_screen.telemetry.collector import TelemetryCollector
 from ryuo_screen.telemetry.cpu import CpuProvider
@@ -65,6 +69,8 @@ VID, PID = proto.VID, proto.PID
 # ------------------------------------------------------------------ transport
 
 def open_device(vid: int | None, pid: int, index: int | None = None):
+    import hid
+
     # vid=None means "any vendor id with this product id" -- the vendor id
     # changes between firmware versions, the product id does not.
     devs = proto.find_devices(hid, vid, pid)
@@ -234,19 +240,71 @@ def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
 
 # ------------------------------------------------------------------ main
 
+def _service_compatible(args) -> bool:
+    split = args.media2 is not None
+    screen_mode = proto.MODE_SPLIT if split else proto.MODE_FULL
+    return not (
+        args.direct or args.vid is not None or args.pid is not None
+        or args.index is not None or args.readout
+        or args.timezone is not None or args.demo_temp is not None
+        or args.rgb_speed != 0.2 or args.rgb_fps != RGB_FPS
+        or args.screen_mode not in (None, screen_mode)
+        or not split and any(value is not None for value in (
+            args.play_mode2, args.title_color2, args.content_color2
+        ))
+    )
+
+
+def _run_service(args, client, state) -> None:
+    play_mode = proto.PLAY_RANDOM if args.shuffle else args.play_mode
+    split = args.media2 is not None
+    screen = {
+        "screen_mode": proto.MODE_SPLIT if split else proto.MODE_FULL,
+        "slots": slots_for_items(proto.sysinfo_slots(*args.items), client),
+        "media": [args.media],
+        "playback_modes": [play_mode],
+        "title_colors": [args.title_color],
+        "content_colors": [args.content_color],
+        "opacity": args.opacity,
+        "rgb_mode": "off" if args.rgb == "off" else args.rgb_mode,
+        "rgb_target": "value" if args.rgb == "off" else args.rgb,
+        "thermal_source": args.rgb_source + ".temperature",
+    }
+    if split:
+        screen["media"].append(args.media2)
+        screen["playback_modes"].append(args.play_mode2 or play_mode)
+        screen["title_colors"].append(args.title_color2 or args.title_color)
+        screen["content_colors"].append(args.content_color2 or args.content_color)
+    brightness = {"brightness": args.brightness}
+    telemetry = {"temperature_unit": args.unit, "refresh_interval": args.interval}
+    # Validate the full config before sending the first independent mutation.
+    ScreenState(**screen, **brightness, **telemetry)
+    if len(args.items) > proto.SLOTS:
+        print(f"note: only the first {proto.SLOTS} items fit on the panel", file=sys.stderr)
+
+    for operation, changes in (
+        ("screen", screen), ("brightness", brightness), ("telemetry-settings", telemetry),
+    ):
+        if operation != "screen":
+            state = client.request("GET", API_PREFIX + "/state")
+        result = patch_state(client, state, "/" + operation, **changes)
+        print_state_result(dict(result, operation=operation))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vid", type=lambda x: int(x, 0), default=None,
                     help="pin a vendor id; default is to accept any, since it "
                          "changes between firmware versions (0B05 on 1.0.3 and "
                          "1.0.10, 1C75 on 1.0.7)")
-    ap.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
+    ap.add_argument("--pid", type=lambda x: int(x, 0))
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--index", type=int, default=None,
                     help="which enumerated interface to open (see --list); "
                          f"default: the one with interface_number={proto.INTERFACE}")
     ap.add_argument("--config-only", action="store_true",
-                    help="push the config and exit (screen reverts after ~10s)")
+                    help="push the config and exit (in direct mode the screen "
+                         "reverts after ~10s)")
     ap.add_argument("--items", nargs="*",
                     default=["CPU Temperature", "GPU Temperature", "Date&Time"],
                     help="up to 6; slot order == on-screen position")
@@ -310,15 +368,21 @@ def main() -> None:
                     help="IANA zone for the Date&Time widget; "
                          "defaults to the host's")
     ap.add_argument("--unit", default="Celsius", choices=["Celsius", "Fahrenheit"])
-    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="refresh interval in seconds (direct HID loop or "
+                         "persisted service telemetry setting)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    add_service_options(ap)
     args = ap.parse_args()
+    pid = PID if args.pid is None else args.pid
 
     if args.list:
-        found = proto.find_devices(hid, args.vid, args.pid)
+        import hid
+
+        found = proto.find_devices(hid, args.vid, pid)
         if not found:
-            ids = (f"{args.vid:04X}:{args.pid:04X}" if args.vid
-                   else f"any vendor with product {args.pid:04X}")
+            ids = (f"{args.vid:04X}:{pid:04X}" if args.vid
+                   else f"any vendor with product {pid:04X}")
             print(f"nothing enumerating as {ids}")
         for i, d in enumerate(found):
             print(f"[{i}] usage_page={d.get('usage_page'):#06x} "
@@ -326,6 +390,22 @@ def main() -> None:
                   f"product={d.get('product_string')!r}")
         return
 
+    try:
+        if _service_compatible(args):
+            client = UnixApiClient(args.socket)
+            try:
+                state = client.request("GET", API_PREFIX + "/state")
+            except ServiceUnavailable:
+                pass
+            else:
+                _run_service(args, client, state)
+                return
+        _run_direct(args, pid)
+    except (ApiError, OwnershipError, ValueError) as ex:
+        sys.exit(f"error: {ex}")
+
+
+def _run_direct(args, pid) -> None:
     try:
         import psutil
     except ImportError:
@@ -394,7 +474,11 @@ def main() -> None:
         sys.exit(f"{ex}.\nThe config carries the playlist, widget slots, CPU/GPU "
                  f"names and time zone; shorten the playlist or the file names.")
 
-    h = open_device(args.vid, args.pid, args.index)
+    with direct_device(args.socket, open_device, args.vid, pid, args.index) as h:
+        _send_direct(h, args, cfg, media, play_mode, psutil, gpu, readouts)
+
+
+def _send_direct(h, args, cfg, media, play_mode, psutil, gpu, readouts) -> None:
     seq = 1
 
     ap_settle = 1.6   # case 14 does postDelayed(doBlockScreen, 1000L)
@@ -414,7 +498,6 @@ def main() -> None:
 
     if args.config_only:
         time.sleep(ap_settle)
-        h.close()
         return
 
     # let the video player finish re-initialising before we touch anything else
@@ -524,7 +607,6 @@ def main() -> None:
             txn(h, proto.POST, proto.RES_DISCONN, None, seq)
         except Exception:
             pass
-        h.close()
 
 
 if __name__ == "__main__":
