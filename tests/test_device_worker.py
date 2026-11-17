@@ -592,3 +592,34 @@ def test_latest_telemetry_cache_reports_error_when_first_collection_fails():
         assert worker.latest_telemetry().catalog == ()
     finally:
         worker.stop()
+
+
+def test_runtime_selectors_are_applied_by_owner_before_sampling():
+    from ryuo_screen.models import SensorRef, TelemetrySnapshot
+
+    observed = []
+    ref = SensorRef("amd", "0000:08:00.0", "gpu.load")
+
+    class Collector:
+        def set_selectors(self, selectors):
+            observed.append(("select", threading.get_ident(), dict(selectors)))
+
+        def sample(self):
+            observed.append(("sample", threading.get_ident(), None))
+            return TelemetrySnapshot({}, 1)
+
+        def catalog(self):
+            return ()
+
+        def to_pc_info(self, snapshot):
+            return proto.pc_info(timestamp_ms=1000)
+
+    transport = FakeTransport()
+    worker = DeviceWorker(transport, Collector(), state=ScreenState(sensor_selectors={"gpu": ref}))
+    worker.start()
+    try:
+        _wait(lambda: any(entry[0] == "sample" for entry in observed))
+        assert observed[0] == ("select", transport.calls[0][0], {"gpu": ref})
+        assert observed[1] == ("sample", transport.calls[0][0], None)
+    finally:
+        worker.stop()

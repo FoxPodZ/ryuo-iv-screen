@@ -725,9 +725,13 @@ class DeviceWorker:
                     error="structured telemetry is unavailable from callable source"
                 )
         else:
-            snapshot = self._telemetry.sample()
             with self._condition:
-                slots = tuple(self._desired_state.slots)
+                state = self._desired_state
+            set_selectors = getattr(self._telemetry, "set_selectors", None)
+            if callable(set_selectors):
+                set_selectors(state.sensor_selectors)
+            snapshot = self._telemetry.sample()
+            slots = state.slots
             catalog = tuple(self._telemetry.catalog())
             aliases = {}
             for slot in slots:

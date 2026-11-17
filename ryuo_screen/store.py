@@ -563,6 +563,7 @@ class ProfileStore:
     ):
         self.directory = Path(directory)
         self.runtime_secrets = dict(runtime_secrets or {})
+        self._factory = {profile.slug: profile for profile in default_miku_profiles()}
 
     def _path(self, slug: str) -> Path:
         _string("profile slug", slug)
@@ -571,10 +572,10 @@ class ProfileStore:
         return self.directory / "{}.json".format(slug)
 
     def list(self) -> List[Profile]:
-        if not self.directory.exists():
-            return []
-        profiles = []
+        profiles = [replace(profile) for profile in self._factory.values()]
         for path in sorted(self.directory.glob("*.json")):
+            if path.stem in self._factory:
+                continue
             try:
                 profiles.append(self._read(path))
             except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
@@ -583,12 +584,15 @@ class ProfileStore:
 
     def get(self, slug: str) -> Profile:
         path = self._path(slug)
+        if slug in self._factory:
+            return replace(self._factory[slug])
         if not path.is_file():
             raise ProfileNotFound(slug)
         return self._read(path)
 
     def create(self, profile: Profile) -> Profile:
         profile = Profile.from_dict(profile.to_dict() if isinstance(profile, Profile) else profile)
+        self._require_custom_slug(profile.slug)
         _atomic_write_json(
             self._path(profile.slug), profile.to_dict(), STATE_MODE, exclusive=True
         )
@@ -600,6 +604,7 @@ class ProfileStore:
         if current.factory:
             raise PermissionError("factory profiles cannot be updated")
         profile = Profile.from_dict(profile.to_dict() if isinstance(profile, Profile) else profile)
+        self._require_custom_slug(profile.slug)
         new_path = self._path(profile.slug)
         if new_path == old_path:
             _atomic_write_json(old_path, profile.to_dict(), STATE_MODE)
@@ -612,6 +617,10 @@ class ProfileStore:
                 # The old profile is retained on a crash/failure; never lose both copies.
                 raise
         return profile
+
+    def _require_custom_slug(self, slug: str) -> None:
+        if slug in self._factory:
+            raise ProfileConflict("profile slug is reserved: {}".format(slug))
 
     def duplicate(self, slug: str, name: str, new_slug: Optional[str] = None) -> Profile:
         source = self.get(slug)

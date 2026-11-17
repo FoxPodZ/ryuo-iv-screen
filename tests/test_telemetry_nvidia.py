@@ -88,3 +88,18 @@ def test_legacy_nvidia_wrapper_preserves_shape_and_samples_each_tick(monkeypatch
     rows[0].update({"temperature.gpu": "59", "fan.speed": "[N/A]"})
     assert ryuo_send._nvidia()["stats"]["temperature"] == 59
     assert ryuo_send._nvidia()["stats"]["fan"] == 0
+
+
+def test_runtime_gpu_selection_uses_uuid_and_rejects_unstable_index():
+    from ryuo_screen.models import SensorRef
+    from ryuo_screen.telemetry.collector import TelemetryCollector
+
+    provider = NvidiaProvider(4, executable="test-nvidia-smi", runner=_fake_smi([_FIRST, _SECOND]))
+    collector = TelemetryCollector([provider])
+    collector.set_selectors({"gpu": SensorRef("nvidia", "GPU-uuid-second", "gpu.temperature")})
+    assert collector.sample().measurements["gpu.temperature"].value == 49
+    collector.set_selectors({"gpu": SensorRef("nvidia", "0", "gpu.temperature")})
+    sample = collector.sample()
+    assert not sample.measurements and sample.errors
+    collector.set_selectors({})
+    assert collector.sample().measurements["gpu.temperature"].value == 63

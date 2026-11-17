@@ -44,11 +44,15 @@ class NvidiaProvider:
         include_vram: bool = True, clock: Callable[[], float] = time.time,
     ) -> None:
         self._selector = selector
+        self._device_override: Optional[str] = None
         self._executable = executable
         self._runner = runner
         self._clock = clock
         self._metrics = _GPU_METRICS + (_VRAM_METRICS if include_vram else ())
         self.selected_name: Optional[str] = None
+
+    def set_device_override(self, device: Optional[str]) -> None:
+        self._device_override = device
 
     def probe(self) -> Sequence[SensorDescriptor]:
         gpus, _ = self._query()
@@ -73,8 +77,9 @@ class NvidiaProvider:
         self.selected_name = gpu.name if gpu is not None else None
         if gpu is None:
             if error is None:
-                error = ("No GPUs returned by nvidia-smi" if self._selector is None else
-                         "Configured NVIDIA GPU {} is unavailable".format(self._selector))
+                selector = self._device_override if self._device_override is not None else self._selector
+                error = ("No GPUs returned by nvidia-smi" if selector is None else
+                         "Configured NVIDIA GPU {} is unavailable".format(selector))
             return TelemetrySnapshot({}, sampled_at, {self.provider_id: error})
 
         return TelemetrySnapshot({
@@ -89,6 +94,8 @@ class NvidiaProvider:
         return SensorRef(self.provider_id, gpu.uuid, key)
 
     def _select(self, gpus: Sequence[_Gpu]) -> Optional[_Gpu]:
+        if self._device_override is not None:
+            return next((gpu for gpu in gpus if gpu.uuid == self._device_override), None)
         if self._selector is None:
             return next(iter(gpus), None)
         selector = str(self._selector).strip()

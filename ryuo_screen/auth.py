@@ -409,6 +409,7 @@ class SecurityPolicy:
 
     def diagnostics(self) -> Dict[str, Any]:
         return {
+            "bindMode": "loopback" if _is_loopback(self.bind_host) else "lan",
             "lanEnabled": self.lan_enabled,
             "authenticationRequired": self.requires_authentication,
             "trustedProxyCount": len(self.trusted_proxies),
@@ -596,24 +597,35 @@ async def security_middleware(request: web.Request, handler):
     return await handler(request)
 
 
-async def auth_status(request: web.Request) -> web.Response:
+def _auth_status_document(request: web.Request) -> Dict[str, Any]:
     policy: SecurityPolicy = request.app[SECURITY_KEY]
     if (
         not policy.requires_authentication
         or _is_unix_request(request)
         or request.get(LOCAL_KEY, False)
     ):
-        return web.json_response(
-            {"required": False, "authenticated": True, "csrfToken": None}
-        )
+        return {"required": False, "authenticated": True, "csrfToken": None}
     session = request.get(SESSION_KEY)
+    return {
+        "required": True,
+        "authenticated": session is not None,
+        "csrfToken": session.csrf_token if session is not None else None,
+        "expiresIn": policy.sessions.remaining(session) if session is not None else 0.0,
+    }
+
+
+async def auth_status(request: web.Request) -> web.Response:
+    return web.json_response(_auth_status_document(request))
+
+
+async def auth_diagnostics(request: web.Request) -> web.Response:
+    policy: SecurityPolicy = request.app[SECURITY_KEY]
+    status = _auth_status_document(request)
+    session = {key: status[key] for key in ("required", "authenticated", "expiresIn")
+               if key in status}
     return web.json_response(
-        {
-            "required": True,
-            "authenticated": session is not None,
-            "csrfToken": session.csrf_token if session is not None else None,
-            "expiresIn": policy.sessions.remaining(session) if session is not None else 0.0,
-        }
+        {"security": policy.diagnostics(), "session": session},
+        headers={"Cache-Control": "no-store"},
     )
 
 

@@ -274,3 +274,40 @@ def test_unavailable_explicit_cpu_usage_does_not_become_load():
                                  "cpu.usage": (None, "CPU usage", "%")})
     collector = TelemetryCollector([provider])
     assert collector.to_pc_info(collector.sample())["cpu"]["usage"] == 0
+
+
+def test_runtime_stable_selectors_reprobe_and_restore_startup_defaults(tmp_path):
+    fake = SysfsBuilder(tmp_path / "sys")
+    discrete, _ = rx7900xtx(fake)
+    (discrete / "gpu_busy_percent").write_text("92", encoding="ascii")
+    other = fake.pci(bdf="0000:05:00.0", card="card0")
+    (other / "gpu_busy_percent").write_text("17", encoding="ascii")
+    board = fake.root / "devices/platform/nct6775.656"
+    fake.hwmon(board, 4, "nct6799", {"temp1": (77000, None), "temp2": (37000, "SYSTIN")})
+    amd = AmdGpuProvider(Sysfs(fake.root), selected_bdf="0000:05:00.0")
+    hwmon = HwmonProvider(Sysfs(fake.root))
+    collector = TelemetryCollector([amd, hwmon], clock=lambda: 0)
+    assert collector.sample().measurements["gpu.load"].value == 17
+    selected = {
+        "gpu": SensorRef("amd", discrete.name, "gpu.load"),
+        "motherboard": SensorRef("hwmon", "platform/nct6775.656/nct6799", "temp1"),
+    }
+    collector.set_selectors(selected)
+    sample = collector.sample()
+    assert sample.measurements["gpu.load"].value == 92
+    assert sample.measurements["motherboard.temperature"].value == 77
+    assert {d.ref for d in collector.catalog() if d.measurement_id == "gpu.load"
+            and d.metadata["selected"]} == {selected["gpu"]}
+    collector.set_selectors({
+        "gpu": SensorRef("amd", "0000:99:00.0", "gpu.load"),
+        "motherboard": SensorRef("hwmon", "missing", "temp1"),
+    })
+    sample = collector.sample()
+    assert "gpu.load" not in sample.measurements
+    assert "0000:99:00.0" in sample.errors["amd"]
+    assert not sample.measurements["motherboard.temperature"].available
+    assert sample.measurements["motherboard.temperature"].error
+    collector.set_selectors({})
+    sample = collector.sample()
+    assert sample.measurements["gpu.load"].value == 17
+    assert sample.measurements["motherboard.temperature"].value == 37

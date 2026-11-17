@@ -59,7 +59,11 @@ class AmdGpuProvider:
 
     def __init__(self, sysfs: Sysfs, selected_bdf: Optional[str] = None) -> None:
         self._sysfs = sysfs
-        self._selected_bdf = selected_bdf.strip().lower() if selected_bdf is not None else None
+        self._startup_bdf = selected_bdf.strip().lower() if selected_bdf is not None else None
+        self._selected_bdf = self._startup_bdf
+
+    def set_device_override(self, device: Optional[str]) -> None:
+        self._selected_bdf = self._startup_bdf if device is None else device
 
     def probe(self) -> Sequence[SensorDescriptor]:
         """Catalog every AMD GPU even when the configured PCI address is absent."""

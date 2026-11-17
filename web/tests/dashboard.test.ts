@@ -79,7 +79,7 @@ describe("dashboard-page", () => {
     expect(text).toContain("12.0 GiB");
     expect(text).toContain("permission denied");
     expect(text).toContain("1234 RPM");
-    expect(element.shadowRoot?.querySelector("main[aria-label='Сводка системы']")).not.toBeNull();
+    expect(element.shadowRoot?.querySelector("section[aria-label='Сводка системы']")).not.toBeNull();
     expect(element.shadowRoot?.querySelector("section[aria-label='Телеметрия']")).not.toBeNull();
     element.remove();
   });

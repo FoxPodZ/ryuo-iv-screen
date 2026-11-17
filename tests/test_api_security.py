@@ -605,3 +605,38 @@ async def test_non_loopback_startup_cannot_use_policy_different_from_middleware(
             uds=None,
             security=_lan_policy(),
         )
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_distinguish_lan_policy_without_disclosing_secrets(tmp_path):
+    verifier = PasswordVerifier.hash("private-password")
+    policy = SecurityPolicy.from_config(AppConfig(
+        listen_host="0.0.0.0", listen_port=8746, lan_enabled=True,
+        password_verifier=verifier, trusted_proxy="127.0.0.0/8",
+    ))
+    session = policy.sessions.create()
+    client, _, _ = await _client(tmp_path, policy)
+    try:
+        unauthenticated = await client.get("/api/v1/diagnostics", headers={
+            "X-Forwarded-For": "192.0.2.12",
+        }, cookies={})
+        local = await client.get("/api/v1/diagnostics")
+        forwarded = await client.get("/api/v1/diagnostics", headers={
+            "X-Forwarded-For": "192.0.2.12",
+        }, cookies={policy.cookie_name: session.token})
+        assert local.status == 200
+        body = await local.json()
+        assert body["security"]["bindMode"] == "lan"
+        assert body["security"]["authenticationRequired"] is True
+        assert body["session"] == {"required": False, "authenticated": True}
+        assert forwarded.status == 200
+        remote = await forwarded.json()
+        assert remote["session"]["required"] is True
+        assert remote["session"]["authenticated"] is True
+        assert remote["session"]["expiresIn"] > 0
+        assert unauthenticated.status == 401
+        for secret in (verifier, session.token, session.csrf_token, "private-password"):
+            assert secret not in json.dumps(remote)
+        assert forwarded.headers["Cache-Control"] == "no-store"
+    finally:
+        await client.close()

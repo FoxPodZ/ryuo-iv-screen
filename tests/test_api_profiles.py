@@ -71,7 +71,7 @@ async def test_profile_crud_import_export_and_apply(tmp_path):
         assert (await created.json())["profile"]["factory"] is False
 
         listing = await (await client.get("/api/v1/profiles")).json()
-        assert [item["slug"] for item in listing["profiles"]] == ["gaming"]
+        assert [item["slug"] for item in listing["profiles"] if not item["factory"]] == ["gaming"]
 
         updated = await client.patch(
             "/api/v1/profiles/gaming", json={"slug": "night", "name": "Night", "brightness": 15}
@@ -142,3 +142,32 @@ async def test_profile_errors_are_structured_and_do_not_mutate(tmp_path):
     assert stale.status == 409
     assert stale_body["currentRevision"] == 2
     assert context.state_store.load().revision == 2
+
+
+@pytest.mark.asyncio
+async def test_builtin_profiles_are_virtual_and_support_api_workflows(tmp_path):
+    client, context = await _client(tmp_path)
+    try:
+        listing = await (await client.get("/api/v1/profiles")).json()
+        assert {profile["name"] for profile in listing["profiles"]} == {
+            "Miku Single 01", "Miku Single 02", "Miku Single 03", "Miku Single 04", "Miku Cycle",
+        }
+        assert all(profile["factory"] for profile in listing["profiles"])
+        path = "/api/v1/profiles/miku-cycle"
+        fetched = await client.get(path)
+        assert (await fetched.json())["profile"]["factory"]
+        exported = await (await client.get(path + "/export")).json()
+        assert exported["media"] == [[f"Ryuo_IV_MIKU_WW_{n:02d}.mp4" for n in range(1, 5)]]
+        assert (await client.post(path + "/apply", json={"revision": 2})).status == 200
+        assert context.state.active_profile == "miku-cycle"
+        assert (await client.patch(path, json={"name": "Changed"})).status == 403
+        assert (await client.delete(path)).status == 403
+        assert (await client.post("/api/v1/profiles", json=_profile("miku-cycle"))).status == 409
+        assert (await client.post("/api/v1/profiles/import", json=exported)).status == 409
+        duplicated = await client.post(path + "/duplicate", json={"name": "Own Copy"})
+        assert duplicated.status == 201
+        result = (await duplicated.json())["profile"]
+        assert not result["factory"] and result["media"] == exported["media"]
+        assert sorted(p.name for p in context.profile_store.directory.iterdir()) == ["own-copy.json"]
+    finally:
+        await client.close()

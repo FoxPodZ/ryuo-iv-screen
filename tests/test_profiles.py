@@ -62,7 +62,7 @@ def test_profile_crud_rename_duplicate_and_restart(tmp_path):
 
     assert created == profile()
     assert store.get("gaming") == profile()
-    assert store.list() == [profile()]
+    assert [item for item in store.list() if not item.factory] == [profile()]
 
     renamed = store.update("gaming", profile("games", "Games"))
     assert renamed.slug == "games"
@@ -75,7 +75,7 @@ def test_profile_crud_rename_duplicate_and_restart(tmp_path):
     assert copied.media == renamed.media
     assert copied.factory is False
 
-    assert [item.slug for item in ProfileStore(store.directory).list()] == [
+    assert [item.slug for item in ProfileStore(store.directory).list() if not item.factory] == [
         "games",
         "games-copy",
     ]
@@ -124,7 +124,8 @@ def test_profile_import_rejects_unknown_or_future_schema(tmp_path):
     with pytest.raises(ValueError, match="unknown"):
         store.import_profile(dict(valid, password_verifier="secret"))
 
-    assert store.list() == []
+    assert all(item.factory for item in store.list())
+    assert not store.directory.exists()
 
 
 def test_profile_export_round_trip_has_no_runtime_secrets(tmp_path):
@@ -144,7 +145,6 @@ def test_profile_export_round_trip_has_no_runtime_secrets(tmp_path):
 def test_factory_profile_cannot_be_deleted(tmp_path):
     store = ProfileStore(tmp_path / "profiles")
     factory = default_miku_profiles()[0]
-    store.create(factory)
 
     with pytest.raises(PermissionError, match="factory"):
         store.delete(factory.slug)
@@ -153,7 +153,6 @@ def test_factory_profile_cannot_be_deleted(tmp_path):
 def test_factory_profile_cannot_be_demoted_then_deleted(tmp_path):
     store = ProfileStore(tmp_path / "profiles")
     factory = default_miku_profiles()[0]
-    store.create(factory)
 
     with pytest.raises(PermissionError, match="factory"):
         store.update(factory.slug, replace(factory, factory=False))
@@ -166,7 +165,6 @@ def test_factory_profile_cannot_be_demoted_then_deleted(tmp_path):
 def test_factory_profile_media_and_identity_cannot_be_mutated(tmp_path):
     store = ProfileStore(tmp_path / "profiles")
     factory = default_miku_profiles()[0]
-    store.create(factory)
     changed = replace(
         factory,
         slug="changed-factory",

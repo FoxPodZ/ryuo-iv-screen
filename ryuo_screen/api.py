@@ -16,6 +16,7 @@ from aiohttp import web
 from .auth import (
     SECURITY_KEY,
     SecurityPolicy,
+    auth_diagnostics,
     auth_login,
     auth_logout,
     auth_status,
@@ -766,6 +767,7 @@ def create_app(context: AppContext) -> web.Application:
     app[SECURITY_KEY] = context.security
     app.cleanup_ctx.append(_live_events_context)
     app.router.add_get(API_PREFIX + "/auth/status", auth_status)
+    app.router.add_get(API_PREFIX + "/diagnostics", auth_diagnostics)
     app.router.add_post(API_PREFIX + "/auth/login", auth_login)
     app.router.add_post(API_PREFIX + "/auth/logout", auth_logout)
     app.router.add_get(API_PREFIX + "/state", _get_state)

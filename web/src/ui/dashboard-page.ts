@@ -82,7 +82,7 @@ export class DashboardPage extends LitElement {
     const {device, state, telemetry} = snapshot;
     return html`
       ${this.view.error ? html`<div class="notice" role="alert">${this.view.error}</div>` : nothing}
-      <main aria-label="Сводка системы">
+      <section aria-label="Сводка системы">
         <div class="hero">
           <section class="panel device" aria-label="Устройство">
             <span class="eyebrow">ROG Ryuo IV · Live</span>
@@ -120,7 +120,7 @@ export class DashboardPage extends LitElement {
             <dt>Media</dt><dd class="media">${state.media.flat().join(" · ") || "Не выбрано"}</dd>
           </dl>
         </section>
-      </main>
+      </section>
     `;
   }
 }

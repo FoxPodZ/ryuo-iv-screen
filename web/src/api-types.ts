@@ -118,3 +118,14 @@ export interface SseSnapshotEvent {
   id: number;
   snapshot: SnapshotDocument;
 }
+
+export interface DiagnosticsDocument {
+  security: {
+    bindMode: "loopback" | "lan";
+    lanEnabled: boolean;
+    authenticationRequired: boolean;
+    trustedProxyCount: number;
+    sessions: {active: number; capacity: number};
+  };
+  session: {required: boolean; authenticated: boolean; expiresIn?: number};
+}

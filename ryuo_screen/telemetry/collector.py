@@ -30,11 +30,36 @@ class TelemetryCollector:
     ) -> None:
         self._providers = tuple(providers)
         self._preferred_gpu_provider = preferred_gpu_provider
+        self._selectors: Dict[str, SensorRef] = {}
+        self._manual_gpu_supported = False
+        self._manual_board_supported = False
         self._clock = clock
         self._last_probe: Optional[float] = None
         self._descriptors: Dict[str, Tuple[SensorDescriptor, ...]] = {}
         self._probe_errors: Dict[str, str] = {}
         self._samples: Dict[str, TelemetrySnapshot] = {}
+
+    def set_selectors(self, selectors: Mapping[str, SensorRef]) -> None:
+        """Apply persisted overrides before sampling, on the collector owner thread."""
+        if selectors == self._selectors:
+            return
+        self._selectors = dict(selectors)
+        gpu = self._selectors.get("gpu")
+        board = self._selectors.get("motherboard")
+        self._manual_gpu_supported = False
+        self._manual_board_supported = False
+        for provider in self._providers:
+            set_gpu = getattr(provider, "set_device_override", None)
+            if callable(set_gpu):
+                matches = gpu is not None and gpu.provider == provider.provider_id
+                set_gpu(gpu.device if matches else None)
+                self._manual_gpu_supported |= matches
+            set_board = getattr(provider, "set_motherboard_override", None)
+            if callable(set_board):
+                matches = board is not None and board.provider == provider.provider_id
+                set_board(board if matches else None)
+                self._manual_board_supported |= matches
+        self.invalidate()
 
     def invalidate(self) -> None:
         """Schedule a fresh probe at the next sample or catalog request."""
@@ -105,8 +130,25 @@ class TelemetryCollector:
             if gpu:
                 gpu_by_provider[provider_id] = gpu
 
+        gpu = self._selectors.get("gpu")
+        board = self._selectors.get("motherboard")
+        if board is not None and (
+            not self._manual_board_supported
+            or not measurements.get("motherboard.temperature")
+            or measurements["motherboard.temperature"].ref != board
+        ):
+            key = "motherboard.temperature"
+            error = "Configured motherboard sensor is unavailable: {}".format(board.stable_id)
+            measurements[key] = Measurement(board, key, None, "°C", sampled_at,
+                                            available=False, error=error)
+
         preferred = self._preferred_gpu_provider
-        if preferred is not None:
+        if gpu is not None:
+            if self._manual_gpu_supported and gpu.provider in gpu_by_provider:
+                measurements.update(gpu_by_provider[gpu.provider])
+            else:
+                errors.setdefault(gpu.provider, "Configured GPU {} is unavailable".format(gpu.device))
+        elif preferred is not None:
             if preferred in gpu_by_provider:
                 measurements.update(gpu_by_provider[preferred])
             else:

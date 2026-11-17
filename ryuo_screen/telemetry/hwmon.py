@@ -22,8 +22,12 @@ class HwmonProvider:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._sysfs = sysfs
+        self._startup_motherboard_ref = motherboard_ref
         self._motherboard_ref = motherboard_ref
         self._clock = clock
+
+    def set_motherboard_override(self, ref: Optional[SensorRef]) -> None:
+        self._motherboard_ref = self._startup_motherboard_ref if ref is None else ref
 
     def probe(self) -> Sequence[SensorDescriptor]:
         fans, temperatures = self._channels()

@@ -1,6 +1,7 @@
 import type {
   AuthStatus,
   DeviceDocument,
+  DiagnosticsDocument,
   MutationResult,
   SensorsResponse,
   SnapshotDocument,
@@ -8,8 +9,22 @@ import type {
   TelemetryDocument,
 } from "./api-types";
 import type {EventConnection, EventConnector} from "./store";
+import {uploadExtension, type MediaCatalog, type MediaResult} from "./media-model";
+import type {ProfileDocument} from "./profile-model";
 
 const API = "/api/v1";
+
+export const mediaPreviewUrl = (kind: "thumbnail" | "proxy", name: string): string =>
+  `${API}/media/preview/${kind}/${encodeURIComponent(name)}`;
+
+const profilePath = (slug: string): string => `/profiles/${encodeURIComponent(slug)}`;
+
+export const profileExportUrl = (slug: string): string => `${API}${profilePath(slug)}/export`;
+
+export interface MediaTransfer {
+  result: Promise<MediaResult>;
+  cancel(): void;
+}
 
 export type ScreenPatchKind = "brightness" | "screen" | "telemetry-settings";
 
@@ -36,7 +51,8 @@ async function readJson<T>(response: Response): Promise<T> {
     const code = typeof body.error === "string" ? body.error : "http_error";
     const message = typeof body.message === "string"
       ? body.message
-      : `HTTP ${response.status}`;
+      : "confirmed" in body && typeof body.error === "string"
+        ? body.error : `HTTP ${response.status}`;
     throw new ApiError(response.status, code, message);
   }
   return body as T;
@@ -94,6 +110,98 @@ export class ApiClient {
 
   async loadSensors(): Promise<SensorsResponse> {
     return this.request<SensorsResponse>("/sensors");
+  }
+
+  async loadMedia(): Promise<MediaCatalog> {
+    const {factory, custom, tools, adb} = await this.request<MediaCatalog>("/media");
+    return {factory, custom, tools, adb: {available: adb.available, reason: adb.reason}};
+  }
+
+  async deleteMedia(name: string): Promise<MediaResult> {
+    return this.request<MediaResult>(`/media/${encodeURIComponent(name)}`, {method: "DELETE"});
+  }
+
+  uploadMedia(
+    file: File,
+    onProgress: (percent: number | null) => void,
+    onProcessing: () => void,
+  ): MediaTransfer {
+    const extension = uploadExtension(file);
+    if (!extension) throw new Error("Выберите файл MP4, GIF, PNG или JPG");
+    const request = new XMLHttpRequest();
+    request.open("POST", `${API}/media/upload`);
+    request.setRequestHeader("Content-Type", "application/octet-stream");
+    request.setRequestHeader("Accept", "application/json");
+    request.setRequestHeader("X-Filename", `upload.${extension}`);
+    if (this.csrfToken) request.setRequestHeader("X-CSRF-Token", this.csrfToken);
+
+    let transmitting = true;
+    const result = new Promise<MediaResult>((resolve, reject) => {
+      request.upload.addEventListener("progress", (event) => {
+        if (transmitting) onProgress(event.lengthComputable && event.total > 0
+          ? 100 * event.loaded / event.total : null);
+      });
+      request.upload.addEventListener("load", () => {
+        transmitting = false;
+        onProcessing();
+      });
+      request.addEventListener("load", () => {
+        transmitting = false;
+        let document: Partial<MediaResult> & {message?: string} = {};
+        try {
+          document = JSON.parse(request.responseText) ?? {};
+        } catch {
+          // A proxy can return a non-JSON error page.
+        }
+        if (request.status >= 200 && request.status < 300 && document.confirmed === true &&
+            typeof document.name === "string" && document.name.length > 0) {
+          resolve(document as MediaResult);
+        } else {
+          reject(new ApiError(request.status, "upload_failed", document.message ||
+            document.error || `Сервер не подтвердил загрузку (HTTP ${request.status})`));
+        }
+      });
+      request.addEventListener("error", () => reject(new Error("Связь с сервером прервалась")));
+      request.addEventListener("abort", () => reject(new DOMException("Передача отменена", "AbortError")));
+      request.send(file);
+    });
+    return {result, cancel: () => { if (transmitting) request.abort(); }};
+  }
+
+  async loadDiagnostics(): Promise<DiagnosticsDocument> {
+    return this.request<DiagnosticsDocument>("/diagnostics");
+  }
+
+  async loadProfiles(): Promise<ProfileDocument[]> {
+    return (await this.request<{profiles: ProfileDocument[]}>("/profiles")).profiles;
+  }
+
+  async writeProfile(
+    path: "create" | "import" | "rename" | "duplicate" | "update",
+    document: Record<string, unknown>,
+    slug = "",
+  ): Promise<ProfileDocument> {
+    const endpoint = {
+      create: "/profiles", import: "/profiles/import", rename: profilePath(slug),
+      update: profilePath(slug), duplicate: `${profilePath(slug)}/duplicate`,
+    }[path];
+    return (await this.request<{profile: ProfileDocument}>(endpoint, {
+      method: path === "rename" || path === "update" ? "PATCH" : "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(document),
+    })).profile;
+  }
+
+  async deleteProfile(slug: string): Promise<void> {
+    await this.request(profilePath(slug), {method: "DELETE"});
+  }
+
+  async applyProfile(slug: string, revision: number): Promise<MutationResult> {
+    return this.request<MutationResult>(`${profilePath(slug)}/apply`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "If-Match": String(revision)},
+      body: JSON.stringify({revision}),
+    });
   }
 
   async patchState(
