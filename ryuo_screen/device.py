@@ -22,6 +22,7 @@ PRIORITY_STATE = 30
 PRIORITY_UI = 50
 PRIORITY_ANIMATION = 100
 MAX_SEQUENCE = 2_147_483_647
+_FAN_ALIAS_OVERFLOW = "fan alias frame overflow"
 
 
 def _boottime() -> float:
@@ -646,27 +647,29 @@ class DeviceWorker:
         ))
 
     def _send_keepalive(self) -> bool:
-        telemetry_ok = True
         try:
-            payload = self._collect_telemetry()
+            payload, telemetry_error = self._collect_telemetry()
             self._last_safe = payload
-            with self._condition:
-                if self._connected:
-                    self._phase = "healthy"
-                    if self._last_error and self._last_error.startswith("telemetry:"):
-                        self._last_error = None
         except Exception as exc:
-            telemetry_ok = False
             payload = self._last_safe
+            telemetry_error = "telemetry: {}".format(exc)
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(
                     self._latest_telemetry.snapshot,
                     self._latest_telemetry.catalog,
                     str(exc),
                 )
-                self._last_error = "telemetry: {}".format(exc)
-                if self._connected:
-                    self._phase = "degraded"
+        telemetry_ok = telemetry_error is None
+        with self._condition:
+            if self._connected:
+                self._phase = "healthy" if telemetry_ok else "degraded"
+            if telemetry_error is not None:
+                self._last_error = telemetry_error
+            elif self._connected and self._last_error and (
+                self._last_error.startswith("telemetry:")
+                or self._last_error == _FAN_ALIAS_OVERFLOW
+            ):
+                self._last_error = None
         self._send(proto.POST, proto.RES_ALL, payload, timeout=0)
         now = self._clock()
         dynamic = self._dynamic_preset_payload(now)
@@ -713,7 +716,8 @@ class DeviceWorker:
             state, title_colors=title, content_colors=content
         ))
 
-    def _collect_telemetry(self) -> Mapping[str, Any]:
+    def _collect_telemetry(self) -> Tuple[Mapping[str, Any], Optional[str]]:
+        warning = None
         if callable(self._telemetry):
             value = self._telemetry()
             with self._condition:
@@ -755,10 +759,9 @@ class DeviceWorker:
                         proto.POST, proto.RES_ALL, aliased, seq=MAX_SEQUENCE
                     )
                 except ValueError:
-                    # Telemetry magnitude can grow after state admission. A
-                    # cosmetic alias must never turn a valid keepalive into a
-                    # reconnect loop; retain the stable original names.
-                    pass
+                    # Telemetry magnitude can grow after state admission.
+                    # Keep the original names and report the missing aliases.
+                    warning = _FAN_ALIAS_OVERFLOW
                 else:
                     value = aliased
             with self._condition:
@@ -769,7 +772,7 @@ class DeviceWorker:
         # then reuses the previously bounded safe payload instead of writing a
         # frame the firmware will drop and reconnecting forever.
         proto.request(proto.POST, proto.RES_ALL, value, seq=MAX_SEQUENCE)
-        return dict(value)
+        return dict(value), warning
 
     def _send(
         self, method: str, resource: str, payload: Optional[Mapping[str, Any]],

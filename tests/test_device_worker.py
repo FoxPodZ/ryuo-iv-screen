@@ -123,7 +123,7 @@ def test_custom_fan_slot_label_gets_matching_keepalive_alias():
     ) + tuple(SlotAssignment() for _ in range(5))
     worker = DeviceWorker(FakeTransport(), telemetry, state=ScreenState(slots=slots))
 
-    payload = worker._collect_telemetry()
+    payload, _ = worker._collect_telemetry()
 
     assert payload["fans"] == [
         {"onBoard": True, "name": "Coolant", "value": 1830}
@@ -196,7 +196,7 @@ def test_six_long_fan_aliases_replace_originals_and_keep_all_frame_bounded():
         FakeTransport(), StructuredTelemetry(),
         state=ScreenState(slots=tuple(slots)),
     )
-    payload = worker._collect_telemetry()
+    payload, _ = worker._collect_telemetry()
 
     assert len(payload["fans"]) == 6
     assert [fan["name"] for fan in payload["fans"]] == [slot.label for slot in slots]
@@ -255,7 +255,7 @@ def test_duplicate_fan_display_labels_are_aliased_by_stable_ref():
         FakeTransport(), StructuredTelemetry(), state=ScreenState(slots=slots)
     )
 
-    payload = worker._collect_telemetry()
+    payload, _ = worker._collect_telemetry()
 
     assert [(fan["name"], fan["value"]) for fan in payload["fans"]] == [
         ("Intake", 1100), ("Exhaust", 900)
@@ -317,15 +317,79 @@ def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
     else:  # pragma: no cover - protocol constants would have changed
         raise AssertionError("test could not find the alias-only frame boundary")
 
+    transport = FakeTransport()
     worker = DeviceWorker(
-        FakeTransport(), telemetry, state=ScreenState(slots=tuple(slots))
+        transport, telemetry, state=ScreenState(slots=tuple(slots)),
+        keepalive_interval=0.02, settle_seconds=0, max_rate=200,
     )
-    payload = worker._collect_telemetry()
+    worker.start()
+    try:
+        _wait(lambda: len([
+            call for call in transport.calls if call[3] == proto.RES_ALL
+        ]) >= 3)
+        status = worker.status()
+        assert status.phase == "degraded"
+        assert status.last_error == "fan alias frame overflow"
+        base_payloads = [
+            call[4] for call in transport.calls if call[3] == proto.RES_ALL
+        ]
+        base_names = ["F{}".format(index) for index in range(6)]
+        assert all(
+            [fan["name"] for fan in payload["fans"]] == base_names
+            for payload in base_payloads
+        )
+        assert len([call for call in transport.calls if call[3] == proto.RES_CONN]) == 1
 
-    assert [fan["name"] for fan in payload["fans"]] == [
-        "F{}".format(index) for index in range(6)
-    ]
-    proto.request(proto.POST, proto.RES_ALL, payload, seq=2_147_483_647)
+        snapshot = TelemetrySnapshot({
+            key: replace(reading, value=1000)
+            for key, reading in snapshot.measurements.items()
+        }, 1.0)
+        alias_names = [slot.label for slot in slots]
+        _wait(lambda: (
+            worker.status().phase == "healthy"
+            and worker.status().last_error is None
+            and any(
+                call[3] == proto.RES_ALL
+                and [fan["name"] for fan in call[4]["fans"]] == alias_names
+                for call in transport.calls
+            )
+        ))
+        assert len([call for call in transport.calls if call[3] == proto.RES_CONN]) == 1
+    finally:
+        worker.stop()
+
+
+def test_oversized_base_telemetry_keeps_last_safe_payload_without_reconnect():
+    transport = FakeTransport()
+    calls = {"count": 0}
+    safe = proto.pc_info(cpu={"load": 23}, timestamp_ms=1)
+    oversized = proto.pc_info(
+        fans=[{"onBoard": True, "name": "Fan", "value": 10 ** 2000}],
+        timestamp_ms=2,
+    )
+
+    def telemetry():
+        calls["count"] += 1
+        return safe if calls["count"] == 1 else oversized
+
+    worker = DeviceWorker(
+        transport, telemetry, state=ScreenState(),
+        keepalive_interval=0.02, settle_seconds=0, max_rate=200,
+    )
+    worker.start()
+    try:
+        _wait(lambda: len([
+            call for call in transport.calls if call[3] == proto.RES_ALL
+        ]) >= 3)
+        assert worker.status().phase == "degraded"
+        assert worker.status().last_error
+        assert "1024-byte report" in worker.status().last_error
+    finally:
+        worker.stop()
+
+    payloads = [call[4] for call in transport.calls if call[3] == proto.RES_ALL]
+    assert payloads and all(payload == safe for payload in payloads)
+    assert len([call for call in transport.calls if call[3] == proto.RES_CONN]) == 1
 
 
 def test_queue_is_bounded_and_equivalent_commands_coalesce():
