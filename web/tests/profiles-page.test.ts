@@ -35,12 +35,16 @@ it("creates from screen state and renames by server slug", async () => {
     String(init.body) === '{"name":"Renamed"}')).toBe(true));
 });
 
+const longSourceSlug = `${"a".repeat(63)}-${"b".repeat(172)}`;
+
 it.each([
-  {slug: "miku-cycle", name: "Miku Cycle"},
-  {slug: "my-profile", name: "My Profile"},
-])("keeps the suggested name and creates distinct copies of $name", async ({slug, name}) => {
+  {slug: "miku-cycle", name: "Miku Cycle", copyStem: "miku-cycle"},
+  {slug: "my-profile", name: "My Profile", copyStem: "my-profile"},
+  {slug: longSourceSlug, name: "Night", copyStem: "night"},
+  {slug: longSourceSlug, name: "Ночь", copyStem: "a".repeat(63)},
+])("keeps the suggested name and creates distinct copies of $name", async ({slug, name, copyStem}) => {
   const available = profiles.map((profile) =>
-    profile.slug === "custom" ? {...profile, slug: "my-profile"} : profile);
+    profile.slug === "custom" && slug !== "miku-cycle" ? {...profile, slug, name} : profile);
   const {store} = await setup((path, init) => {
     if (path === "/api/v1/profiles") return json({profiles: available});
     if (path !== `/api/v1/profiles/${slug}/duplicate` || init.method !== "POST") return;
@@ -56,7 +60,7 @@ it.each([
   const root = await render(new ProfilesPage(), store);
   const originalSelector = `[data-profile="${slug}"]`;
   await vi.waitFor(() => expect(root.querySelector(originalSelector)).toBeTruthy());
-  for (const suffix of ["copy", "copy-2"]) {
+  for (const [count, suffix] of [[1, "copy"], [2, "copy-2"]] as const) {
     click(get(root, originalSelector), "[data-duplicate]");
     const nameInput = '[name="edit-profile-name"]';
     const suggest = `${name} (копия)`;
@@ -65,7 +69,15 @@ it.each([
     await vi.waitFor(() => {
       const alert = root.querySelector('[role="alert"]');
       expect(alert?.textContent).toBeUndefined();
-      expect(root.querySelector(`[data-profile="${slug}-${suffix}"] h3`)?.textContent).toBe(suggest);
+      const copiedSlugs = Array.from(root.querySelectorAll<HTMLElement>("[data-profile]"))
+        .filter((row) => row.querySelector("h3")?.textContent === suggest)
+        .map((row) => row.dataset.profile!);
+      expect(copiedSlugs).toHaveLength(count);
+      for (const copiedSlug of copiedSlugs) {
+        expect(copiedSlug).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+        expect(copiedSlug.length).toBeLessThanOrEqual(96);
+      }
+      expect(copiedSlugs).toContain(`${copyStem}-${suffix}`);
       expect(root.querySelector(nameInput)).toBeNull();
     });
   }

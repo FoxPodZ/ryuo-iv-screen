@@ -13,16 +13,23 @@ export function configurationFromState(state: ScreenStateDocument): ProfileConfi
   return configuration;
 }
 
+function normalizeProfileSlug(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
 export function profileSlug(name: string): string {
-  const readable = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const readable = normalizeProfileSlug(name);
   if (readable) return readable;
   const random = crypto.getRandomValues(new Uint8Array(8));
   return "profile-" + Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export function profileCopySlug(sourceSlug: string, profiles: readonly ProfileDocument[]): string {
+export function profileCopySlug(source: ProfileDocument, profiles: readonly ProfileDocument[]): string {
   const taken = new Set(profiles.map(({slug}) => slug));
-  const base = `${sourceSlug}-copy`;
+  const readable = normalizeProfileSlug(source.name) || source.slug;
+  // Leave room for copy suffixes and the server's atomic temporary filename.
+  const stem = readable.slice(0, 64).replace(/-$/, "");
+  const base = `${stem}-copy`;
   let candidate = base;
   for (let suffix = 2; taken.has(candidate); suffix += 1) {
     candidate = `${base}-${suffix}`;

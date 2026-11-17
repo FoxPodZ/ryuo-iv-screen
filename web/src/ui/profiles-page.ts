@@ -68,7 +68,7 @@ export class ProfilesPage extends LitElement {
     const name = edit?.name.trim();
     if (!edit || !name || !this.store) return;
     const document = edit.action === "duplicate"
-      ? {name, slug: profileCopySlug(edit.profile.slug, this.store.value.profiles ?? [])}
+      ? {name, slug: profileCopySlug(edit.profile, this.store.value.profiles ?? [])}
       : {name};
     void this.run(async () => {
       await this.store!.writeProfile(edit.action, document, edit.profile.slug);
