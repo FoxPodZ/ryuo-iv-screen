@@ -3,7 +3,8 @@ import {customElement, property, state} from "lit/decorators.js";
 import {live} from "lit/directives/live.js";
 import {profileExportUrl} from "../api";
 import {
-  configurationFromState, differsFromProfile, parseProfileImport, profileSlug, type ProfileDocument,
+  configurationFromState, differsFromProfile, parseProfileImport, profileCopySlug, profileSlug,
+  type ProfileDocument,
 } from "../profile-model";
 import type {AppStore, AppView} from "../store";
 import {libraryStyles} from "./library-styles";
@@ -66,7 +67,9 @@ export class ProfilesPage extends LitElement {
     const edit = this.edit;
     const name = edit?.name.trim();
     if (!edit || !name || !this.store) return;
-    const document = edit.action === "duplicate" ? {name, slug: profileSlug(name)} : {name};
+    const document = edit.action === "duplicate"
+      ? {name, slug: profileCopySlug(edit.profile.slug, this.store.value.profiles ?? [])}
+      : {name};
     void this.run(async () => {
       await this.store!.writeProfile(edit.action, document, edit.profile.slug);
       this.edit = null;

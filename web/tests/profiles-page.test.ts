@@ -11,9 +11,9 @@ it("renders five built-in Miku examples and the active indicator", async () => {
   expect(get(root, '[data-profile="miku-cycle"]').querySelector("[data-delete]")).toBeNull();
 });
 
-it("creates from screen state, duplicates built-ins and renames by server slug", async () => {
+it("creates from screen state and renames by server slug", async () => {
   const {store, requests} = await setup((path, init) => {
-    if ((init.method === "POST" && (path.endsWith("/duplicate") || path.endsWith("/profiles"))) ||
+    if ((init.method === "POST" && path.endsWith("/profiles")) ||
         (init.method === "PATCH" && path.endsWith("/custom"))) return json({profile: profiles[5]}, 201);
   });
   const root = await render(new ProfilesPage(), store);
@@ -24,14 +24,6 @@ it("creates from screen state, duplicates built-ins and renames by server slug",
   await vi.waitFor(() => expect(requests.some(({path, init}) => path.endsWith("/profiles") && init.method === "POST")).toBe(true));
   const create = requests.find(({path, init}) => path.endsWith("/profiles") && init.method === "POST")!;
   expect(JSON.parse(String(create.init.body))).toMatchObject({slug: "night", name: "Night", screen_mode: "Screen Splitting"});
-  const cycle = get(root, '[data-profile="miku-cycle"]');
-  await vi.waitFor(() => expect(get<HTMLButtonElement>(cycle, "[data-duplicate]").disabled).toBe(false));
-  click(cycle, "[data-duplicate]");
-  await vi.waitFor(() => expect(root.querySelector('[name="edit-profile-name"]')).toBeTruthy());
-  change(root, '[name="edit-profile-name"]', "My Cycle", "input");
-  await vi.waitFor(() => expect(get<HTMLButtonElement>(root, "[data-save-name]").disabled).toBe(false));
-  click(root, "[data-save-name]");
-  await vi.waitFor(() => expect(requests.some(({path}) => path.endsWith("/miku-cycle/duplicate"))).toBe(true));
   const custom = get(root, '[data-profile="custom"]');
   await vi.waitFor(() => expect(get<HTMLButtonElement>(custom, "[data-rename]").disabled).toBe(false));
   click(custom, "[data-rename]");
@@ -41,6 +33,43 @@ it("creates from screen state, duplicates built-ins and renames by server slug",
   click(root, "[data-save-name]");
   await vi.waitFor(() => expect(requests.some(({path, init}) => path.endsWith("/custom") && init.method === "PATCH" &&
     String(init.body) === '{"name":"Renamed"}')).toBe(true));
+});
+
+it.each([
+  {slug: "miku-cycle", name: "Miku Cycle"},
+  {slug: "my-profile", name: "My Profile"},
+])("keeps the suggested name and creates distinct copies of $name", async ({slug, name}) => {
+  const available = profiles.map((profile) =>
+    profile.slug === "custom" ? {...profile, slug: "my-profile"} : profile);
+  const {store} = await setup((path, init) => {
+    if (path === "/api/v1/profiles") return json({profiles: available});
+    if (path !== `/api/v1/profiles/${slug}/duplicate` || init.method !== "POST") return;
+    const destination = JSON.parse(String(init.body)) as {name: string; slug: string};
+    if (available.some((profile) => profile.slug === destination.slug)) {
+      return json({error: "conflict", message: `Slug already exists: ${destination.slug}`}, 409);
+    }
+    const original = available.find((profile) => profile.slug === slug)!;
+    const copy = {...original, ...destination, factory: false};
+    available.push(copy);
+    return json({profile: copy}, 201);
+  });
+  const root = await render(new ProfilesPage(), store);
+  const originalSelector = `[data-profile="${slug}"]`;
+  await vi.waitFor(() => expect(root.querySelector(originalSelector)).toBeTruthy());
+  for (const suffix of ["copy", "copy-2"]) {
+    click(get(root, originalSelector), "[data-duplicate]");
+    const nameInput = '[name="edit-profile-name"]';
+    const suggest = `${name} (копия)`;
+    await vi.waitFor(() => expect(get<HTMLInputElement>(root, nameInput)?.value).toBe(suggest));
+    click(root, "[data-save-name]");
+    await vi.waitFor(() => {
+      const alert = root.querySelector('[role="alert"]');
+      expect(alert?.textContent).toBeUndefined();
+      expect(root.querySelector(`[data-profile="${slug}-${suffix}"] h3`)?.textContent).toBe(suggest);
+      expect(root.querySelector(nameInput)).toBeNull();
+    });
+  }
+  expect(get(root, `${originalSelector} h3`).textContent).toBe(name);
 });
 
 it("exports through the server, applies with a revision and confirms before delete", async () => {

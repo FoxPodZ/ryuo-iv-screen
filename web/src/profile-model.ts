@@ -20,6 +20,16 @@ export function profileSlug(name: string): string {
   return "profile-" + Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+export function profileCopySlug(sourceSlug: string, profiles: readonly ProfileDocument[]): string {
+  const taken = new Set(profiles.map(({slug}) => slug));
+  const base = `${sourceSlug}-copy`;
+  let candidate = base;
+  for (let suffix = 2; taken.has(candidate); suffix += 1) {
+    candidate = `${base}-${suffix}`;
+  }
+  return candidate;
+}
+
 export function parseProfileImport(text: string): Record<string, unknown> {
   let parsed: unknown;
   try {
