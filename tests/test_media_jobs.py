@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -286,6 +287,9 @@ async def test_cancellation_waits_for_background_converter_before_cleanup(tmp_pa
     task.cancel()
     await asyncio.sleep(0.02)
     assert not task.done()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -447,3 +451,50 @@ async def test_upload_binding_expires_at_any_observed_disconnect(tmp_path, monke
     with pytest.raises(MediaTargetChanged):
         await manager.upload(Stream([b"media"]), "image", token)
     assert pushes == []
+
+
+@pytest.mark.asyncio
+async def test_slow_automatic_push_and_status_leave_the_default_executor_available(tmp_path, monkeypatch):
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    pushing = asyncio.Event()
+    release = threading.Event()
+    custom = []
+    discoveries_after_push = []
+
+    def run(argv, **kwargs):
+        if argv[1:] == ["devices", "-l"]:
+            if release.is_set():
+                discoveries_after_push.append(argv)
+            return Result("List of devices attached\nA device usb:1-3 transport_id:7")
+        assert argv[1:4] == ["-t", "7", "push"]
+        loop.call_soon_threadsafe(pushing.set)
+        assert release.wait(5)
+        custom.append(Path(argv[-1]).name)
+        return Result()
+
+    monkeypatch.setattr("ryuo_screen.media._cooler_usb_identity", lambda: ("1-3", "A"))
+    adb = AdbBackend(runner=run, which=lambda _: "stub-adb")
+    manager = MediaManager(tmp_path, FakeTools(), adb, object(), lambda: MediaCatalog((), tuple(custom)))
+    target, token = await manager.adb_status()
+
+    async def unrelated_work():
+        return await loop.run_in_executor(None, release.is_set)
+
+    upload = asyncio.create_task(manager.upload(Stream([b"media"]), "image", token))
+    readers = []
+    try:
+        await asyncio.wait_for(pushing.wait(), 1)
+        readers = [asyncio.create_task(manager.adb_status()) for _ in range(4)]
+        await asyncio.sleep(0)  # Let all four requests reach their first await.
+        # Password verification and other API work use this same executor.
+        unrelated = asyncio.create_task(unrelated_work())
+        assert await asyncio.wait_for(unrelated, 1) is False
+    finally:
+        release.set()
+        result = await upload
+        statuses = await asyncio.gather(*readers)
+
+    assert result.confirmed
+    assert statuses == [(target, token)] * 4
+    assert len(discoveries_after_push) <= 1

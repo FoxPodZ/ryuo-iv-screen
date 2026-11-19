@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -483,20 +484,32 @@ class MediaPreview:
     content_type: str
 
 
-async def _call_sync(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _call_sync(
+    function: Callable[..., Any], *args: Any, executor: Optional[Executor] = None, **kwargs: Any,
+) -> Any:
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(None, lambda: function(*args, **kwargs))
+    future = loop.run_in_executor(executor, lambda: function(*args, **kwargs))
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:
         # The executor call cannot be killed safely.  Delay cancellation until
         # it has stopped touching per-job files, then let the caller's finally
         # remove the directory without racing ffmpeg/adb.
-        try:
-            await asyncio.shield(future)
-        except Exception:
-            pass
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
         raise
+
+
+async def _call_adb(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    # Each admitted job can issue one ADB call at a time, plus one shared
+    # status probe. Retire each worker as soon as its one command finishes.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ryuo-adb") as worker:
+        return await _call_sync(function, *args, executor=worker, **kwargs)
 
 
 class MediaJob:
@@ -523,7 +536,7 @@ class MediaJob:
         # original_name is deliberately never used in a path or command.
         del original_name
         if target is None:
-            target = await _call_sync(self.adb.available)
+            target = await _call_adb(self.adb.available)
         if not target.available:
             return MediaJobResult(self.job_id, None, False, False, target.reason)
         self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -556,7 +569,7 @@ class MediaJob:
                 await _call_sync(self.tools.convert, source, output, plan, self.max_bytes)
             if output.stat().st_size > self.max_bytes:
                 raise ValueError("converted media exceeds size limit")
-            pushed = await _call_sync(self.adb.push, output, name, target=target)
+            pushed = await _call_adb(self.adb.push, output, name, target=target)
             if not pushed:
                 return MediaJobResult(self.job_id, name, False, False, "ADB push failed")
             refreshed = self.refresh_catalog()
@@ -602,6 +615,7 @@ class MediaManager:
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_results = max_results
         self._active_jobs = 0
+        self._status_probe: Optional[asyncio.Task] = None
         self.jobs: "OrderedDict[str, MediaJobResult]" = OrderedDict()
 
     def catalog(self) -> MediaCatalog:
@@ -611,7 +625,9 @@ class MediaManager:
         return value
 
     async def adb_status(self) -> Tuple[AdbAvailability, Optional[str]]:
-        target = await _call_sync(self.adb.available)
+        if self._status_probe is None or self._status_probe.done():
+            self._status_probe = asyncio.create_task(_call_adb(self.adb.available))
+        target = await asyncio.shield(self._status_probe)
         return target, target.target_token
 
     @asynccontextmanager
@@ -637,8 +653,8 @@ class MediaManager:
         self, stream: Any, original_name: str, target_token: Optional[str] = None,
     ) -> MediaJobResult:
         async with self._admit():
-            target, current_token = await self.adb_status()
-            if target_token != current_token:
+            target = await _call_adb(self.adb.available)
+            if target_token != target.target_token:
                 raise MediaTargetChanged("refresh media status and confirm the current ADB target")
             job = MediaJob(
                 self.temp_root, self.tools, self.adb, self._refresh_conn_catalog,
@@ -662,7 +678,7 @@ class MediaManager:
             source = directory / "source.media"
             destination = directory / ("thumbnail.jpg" if kind == "thumbnail" else "proxy.mp4")
             try:
-                pulled = await _call_sync(
+                pulled = await _call_adb(
                     self.adb.pull, name, source,
                     factory=classification == "factory", max_bytes=self.max_bytes,
                 )
