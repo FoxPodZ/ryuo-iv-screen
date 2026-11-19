@@ -15,11 +15,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -282,6 +283,7 @@ class AdbAvailability:
     serial: Optional[str] = None
     transport_id: Optional[str] = None
     usb_port: Optional[str] = None
+    target_token: Optional[str] = None
 
     def target_args(self) -> Tuple[str, str]:
         if self.transport_id is not None:
@@ -326,11 +328,23 @@ class AdbBackend:
         self._popen = popen
         self._which = which
         self._timeout = float(timeout)
+        self._target_lock = threading.RLock()
+        self._last_target: Optional[AdbAvailability] = None
+        self._target_token: Optional[str] = None
 
     def _tool(self) -> Optional[str]:
         return self._which(self._adb_name)
 
     def available(self) -> AdbAvailability:
+        # Push, pull and status observations all advance the same generation.
+        with self._target_lock:
+            target = self._discover()
+            if target != self._last_target:
+                self._last_target = target
+                self._target_token = uuid.uuid4().hex if target.transport_id else None
+            return replace(target, target_token=self._target_token)
+
+    def _discover(self) -> AdbAvailability:
         tool = self._tool()
         if not tool:
             return AdbAvailability(False, "adb is not installed")
@@ -370,21 +384,24 @@ class AdbBackend:
         self, source: Path, name: str, *, target: Optional[AdbAvailability] = None,
     ) -> bool:
         proto.check_media_name(name)
-        availability = self.available()
-        if target is not None and availability != target:
-            return False
-        if not availability.available or availability.serial is None:
-            return False
-        tool = self._tool()
-        assert tool is not None
-        try:
-            result = self._runner([
-                tool, *availability.target_args(), "push", str(Path(source)),
-                REMOTE_MEDIA_DIR + "/" + name,
-            ], capture_output=True, text=True, timeout=self._timeout)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return getattr(result, "returncode", 0) == 0
+        # Serialize observations with automatic dispatch so status cannot
+        # revoke the generation between the final check and the command.
+        with self._target_lock if self.serial is None else nullcontext():
+            availability = self.available()
+            if target is not None and availability != target:
+                return False
+            if not availability.available or availability.serial is None:
+                return False
+            tool = self._tool()
+            assert tool is not None
+            try:
+                result = self._runner([
+                    tool, *availability.target_args(), "push", str(Path(source)),
+                    REMOTE_MEDIA_DIR + "/" + name,
+                ], capture_output=True, text=True, timeout=self._timeout)
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return getattr(result, "returncode", 0) == 0
 
     def pull(
         self, name: str, destination: Path, *, factory: bool = False,
@@ -585,8 +602,6 @@ class MediaManager:
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_results = max_results
         self._active_jobs = 0
-        self._observed_target: Optional[AdbAvailability] = None
-        self._target_token: Optional[str] = None
         self.jobs: "OrderedDict[str, MediaJobResult]" = OrderedDict()
 
     def catalog(self) -> MediaCatalog:
@@ -597,12 +612,7 @@ class MediaManager:
 
     async def adb_status(self) -> Tuple[AdbAvailability, Optional[str]]:
         target = await _call_sync(self.adb.available)
-        # A nonce identifies one observed USB attachment to this service.
-        # Lookups and token rotation run together on the API event loop.
-        if target != self._observed_target:
-            self._observed_target = target
-            self._target_token = uuid.uuid4().hex if target.available and target.transport_id else None
-        return target, self._target_token
+        return target, target.target_token
 
     @asynccontextmanager
     async def _admit(self):

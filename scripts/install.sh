@@ -11,23 +11,10 @@ unit=/etc/systemd/system/ryuo-screen.service
     echo "Build the Web UI in web/ before installing." >&2; exit 1;
 }
 
-# Compare real path components in both directions, including an existing
-# destination symlink whose target is outside the installation prefix.
-overlap() {
-    case "$1/" in "${2%/}/"*) return 0 ;; esac
-    case "$2/" in "${1%/}/"*) return 0 ;; esac
-    return 1
-}
-for output in "$prefix" "$prefix/venv" "$prefix/web/dist"; do
-    destination=$(realpath -m -- "$output")
-    for input in "$src" "$src/web/dist" "$src/web/dist/assets" "$src/web/dist/index.html" "$src"/web/dist/assets/*; do
-        source_path=$(realpath -m -- "$input")
-        if overlap "$source_path" "$destination"; then
-            echo "Source $source_path overlaps installation path $destination." >&2
-            exit 1
-        fi
-    done
-done
+python3 "$src/scripts/check-install-paths.py" "$prefix" "$src" \
+    "$src/web/dist" "$src/web/dist/assets" "$src/web/dist/index.html" "$src"/web/dist/assets/* \
+    "$src/LICENSE" "$src/LICENSE-ADDITIONAL-TERMS.md" "$src/70-ryuo.rules" \
+    "$src/packaging/config.toml" "$src/packaging/ryuo-screen.tmpfiles" "$src/packaging/ryuo-screen.service"
 
 # Resolve, download and build the project and every dependency while the old
 # service is still running. After cutover starts pip can use local wheels only.

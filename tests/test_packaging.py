@@ -4,6 +4,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,12 +120,16 @@ def test_installer_resolves_and_builds_all_wheels_before_stopping_service():
     assert '--no-index --find-links "$wheels"' in script
 
 
-def test_checkout_overlap_checked_before_runtime_or_service_changes():
-    script = (ROOT / "scripts/install.sh").read_text()
-    guard = 'if overlap "$source_path" "$destination"'
-    assert guard in script
-    assert "exit 1" in script[script.index(guard):script.index("getent group")]
-    assert script.index(guard) < script.index("systemctl stop ryuo-screen.service")
+def test_checkout_overlap_checked_before_runtime_or_service_changes(tmp_path):
+    fixture = InstallerFixture(tmp_path)
+    nested = fixture.prefix / "venv/checkout"
+    fixture.src.rename(nested)
+    fixture.src = nested
+    fixture.script = nested / "scripts/install.sh"
+    result = fixture.run()
+    assert result.returncode != 0 and "installation path" in result.stderr
+    assert fixture.log.read_text() == ""
+    assert fixture.active.exists()
 
 
 def test_failed_runtime_replacement_restores_old_paths_and_service_activity():
@@ -158,6 +163,7 @@ class InstallerFixture:
         scripts = self.src / "scripts"
         scripts.mkdir()
         self.script = scripts / "install.sh"
+        shutil.copyfile(ROOT / "scripts/check-install-paths.py", scripts / "check-install-paths.py")
         # Every system destination in this copy points inside the fixture.
         self.script.write_text(re.sub(r"/(?=opt/|etc/|var/)", str(root) + "/",
                                       (ROOT / "scripts/install.sh").read_text()))
@@ -187,6 +193,9 @@ fi''')
 
     def stub(self, name, body):
         path = self.bin / name
+        if name == "python3":
+            preflight = 'case "$1" in */scripts/check-install-paths.py) exec {} "$@" ;; esac\n'
+            body = preflight.format(shlex.quote(sys.executable)) + body
         path.write_text("#!/bin/sh\n" + body + "\n")
         path.chmod(0o755)
 
@@ -228,6 +237,25 @@ def test_overlapping_symlinked_assets_rejected_before_any_service_or_build(tmp_p
     result = fixture.run()
     assert result.returncode != 0
     assert fixture.log.read_text() == "", result.stderr
+    assert fixture.active.exists()
+    assert (src / "index.html").read_text() == "new UI"
+    assert (dest / "index.html").read_text() == "old UI"
+
+
+def test_source_link_through_installed_bundle_is_rejected_at_preflight(tmp_path):
+    fixture = InstallerFixture(tmp_path)
+    src = fixture.src / "web/dist"
+    dest = fixture.prefix / "web/dist"
+    bundle = tmp_path / "bundle"
+    src.rename(bundle)
+    (dest / "source").symlink_to(bundle, target_is_directory=True)
+    src.symlink_to(dest / "source", target_is_directory=True)
+
+    # A sentinel fails on the first dependency operation, before any cutover.
+    fixture.stub("python3", 'echo "unexpected preparation" >> "$LOG"; exit 1')
+    result = fixture.run()
+    assert result.returncode != 0 and "installation path" in result.stderr
+    assert fixture.log.read_text() == ""
     assert fixture.active.exists()
     assert (src / "index.html").read_text() == "new UI"
     assert (dest / "index.html").read_text() == "old UI"

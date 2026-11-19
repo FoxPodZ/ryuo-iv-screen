@@ -9,7 +9,7 @@ import pytest
 
 from ryuo_screen.media import (
     AdbAvailability, AdbBackend, MediaBusy, MediaCatalog, MediaInfo, MediaJob, MediaManager,
-    MediaTools,
+    MediaTargetChanged, MediaTools,
 )
 
 
@@ -405,4 +405,45 @@ async def test_upload_never_retargets_after_a_second_cooler_replaces_the_first(t
     job = MediaJob(tmp_path / "jobs", FakeTools(), backend, lambda: MediaCatalog())
     result = await job.run(ReconnectDuringUpload([b"media"]))
     assert not result.applied
+    assert pushes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observer", ["status", "push"])
+async def test_upload_binding_expires_at_any_observed_disconnect(tmp_path, monkeypatch, observer):
+    connected = True
+    pushes = []
+
+    def run(argv, **kwargs):
+        if argv[1:] == ["devices", "-l"]:
+            row = "A device usb:1-3 transport_id:7" if connected else ""
+            return Result("List of devices attached\n" + row)
+        pushes.append(argv)
+        return Result(returncode=1)
+
+    monkeypatch.setattr("ryuo_screen.media._cooler_usb_identity", lambda: ("1-3", "A"))
+    adb = AdbBackend(runner=run, which=lambda _: "stub-adb")
+    manager = MediaManager(tmp_path, FakeTools(), adb, object(), lambda: MediaCatalog())
+    _, token = await manager.adb_status()
+    assert token
+
+    class DisconnectAfterAdmission(Stream):
+        async def read(self, size):
+            nonlocal connected
+            if self.chunks:
+                connected = False
+                if observer == "status":
+                    absent, _ = await manager.adb_status()
+                    assert not absent.available
+                    connected = True
+                    _, new_token = await manager.adb_status()
+                    assert new_token and new_token != token
+            return await super().read(size)
+
+    result = await manager.upload(DisconnectAfterAdmission([b"media"]), "image", token)
+    assert not result.applied and not result.confirmed
+    assert pushes == []
+    connected = True
+    with pytest.raises(MediaTargetChanged):
+        await manager.upload(Stream([b"media"]), "image", token)
     assert pushes == []
