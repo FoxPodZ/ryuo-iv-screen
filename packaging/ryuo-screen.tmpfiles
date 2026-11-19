@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+d /run/ryuo-screen 0750 ryuo-screen ryuo-screen -
+d /var/lib/ryuo-screen 0750 ryuo-screen ryuo-screen -
+d /var/cache/ryuo-screen 0750 ryuo-screen ryuo-screen -

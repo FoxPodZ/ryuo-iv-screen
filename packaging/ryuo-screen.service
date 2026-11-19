@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=ROG Ryuo IV screen and telemetry service
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+User=ryuo-screen
+Group=ryuo-screen
+ExecStart=/opt/ryuo-screen/venv/bin/python -m ryuo_screen.daemon --config /etc/ryuo-screen/config.toml --web-root /opt/ryuo-screen/web/dist
+Environment=HOME=/var/lib/ryuo-screen
+Environment=ADB_SERVER_SOCKET=localfilesystem:/run/ryuo-screen/adb.sock
+UMask=0027
+Restart=on-failure
+RestartSec=3s
+RuntimeDirectory=ryuo-screen
+RuntimeDirectoryMode=0750
+StateDirectory=ryuo-screen
+StateDirectoryMode=0750
+CacheDirectory=ryuo-screen
+CacheDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+CapabilityBoundingSet=
+ReadWritePaths=/run/ryuo-screen /var/lib/ryuo-screen /var/cache/ryuo-screen
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-usb_device rw
+DeviceAllow=char-nvidia-frontend rw
+
+[Install]
+WantedBy=multi-user.target

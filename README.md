@@ -21,8 +21,8 @@ cooler with `adb logcat`. No ASUS code is included or redistributed.
 
 The Python scripts are the **reference implementation**: proof that the write-up
 is right, and a proof of concept that happens to be good enough for daily use.
-No service, no GUI, no installer, no kernel module, and nothing here touches the
-cooler's firmware. If you want to write your own client in another language,
+A Linux service and browser UI build on that same protocol. If you want to
+write your own client in another language,
 `ryuo_proto.py` plus PROTOCOL.md are the only two things you need.
 
 *Where this is useful:* ASUS ships the screen with **Info Hub**, a Windows-only
@@ -97,7 +97,7 @@ Everything below is documented in PROTOCOL.md and driven by the scripts here:
 | Media delete (`mediaDelete`) | ✅ `ryuo_ctl.py rm`; the delete-everything-else mode is read from source |
 | Media *upload* over HID | 💀 doesn't exist — `transport` replies "success" and never receives a byte. Use `adb push` |
 | Pump control (`turboPump`) | 💀 targets a pump driver this board doesn't have |
-| AMD GPU telemetry | ⚠️ only NVIDIA (`nvidia-smi`) is wired up so far |
+| AMD GPU telemetry | Linux service reads native `amdgpu` sysfs by PCI address |
 | CPU temperature & fan speeds on Windows | ⚠️ Linux only — deliberately; see *Known limits* below |
 
 ---
@@ -183,27 +183,44 @@ of 8px text. If you can't get video at all, you can still drive the UI blind:
 
 ---
 
-## Install
+## Linux service and Web UI
+
+From a trusted checkout on Fedora:
+
+```sh
+sudo dnf install python3 python3-pip hidapi android-tools ffmpeg-free
+sudo ./scripts/install.sh
+systemctl status ryuo-screen.service
+curl http://127.0.0.1:8746/api/v1/device
+```
+
+Replug the cooler and open [the control panel](http://127.0.0.1:8746/). One non-root device worker owns HID, sends keepalives and restores saved settings after reconnect. The browser and compatible CLI commands both use the daemon API. The dashboard shows native AMD, NVIDIA, CPU and motherboard readings. The screen editor previews the six-slot layout. Check the physical panel for actual geometry, color and playback.
+
+In Profiles, the four Miku Single examples reference `Ryuo_IV_MIKU_WW_01.mp4` through `Ryuo_IV_MIKU_WW_04.mp4`. Miku Cycle plays the four in sequence. Check the exact filenames under Media before applying. The HID upload command is a firmware stub. The service transfers files over ADB and checks the refreshed device catalog.
+
+[Deployment, migration and rollback](docs/deployment.md) · [Web UI guide](docs/web-ui.md) · [Telemetry and selectors](docs/telemetry.md) · [HTTP API](docs/api.md) · [Remote access and security](docs/security.md)
+
+## Install the standalone CLI
 
 Python **3.8+** (tested on 3.11 and 3.12; the `hidapi` wheel may set a higher
 floor than the code does on older interpreters).
 
 ```bash
-pip install -r requirements.txt        # hidapi, psutil
+python -m pip install -r requirements.txt
 ```
 
 `hidapi` needs udev permission to talk to the device:
 
 ```bash
-sudo cp 70-ryuo.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
+getent group ryuo-screen >/dev/null || sudo groupadd --system ryuo-screen
+sudo install -m 0644 70-ryuo.rules /etc/udev/rules.d/70-ryuo.rules
+sudo udevadm control --reload-rules
 ```
 
 then replug the cooler. The shipped rule uses `TAG+="uaccess"`, which hands the
 device to whoever is physically logged in and takes it back on logout — so no
 `chmod 666` on a raw HID node that every process on the box can then write to.
-If you're not on systemd, the file has a commented `plugdev` line instead. Or
-just run as root.
+The rule also grants the service group access to the matching USB device for ADB.
 
 **On Windows: close ASUS Info Hub first.** It doesn't lock the device — both
 can have it open at the same time — but it keeps talking to the cooler. Its
@@ -213,7 +230,9 @@ rather than yours; and a config it pushes replaces the one you set.
 
 ---
 
-## Quickstart
+## Standalone CLI quickstart
+
+These direct protocol examples assume the service and any other HID writer are stopped. With the service running, supported CLI changes go through its Unix socket and persist. For example, run `python ryuo_ctl.py brightness 60` from the checkout as a trusted socket user.
 
 ```bash
 # see what's actually enumerating (prints an index per interface)
@@ -357,11 +376,7 @@ Passing `--media2` flips `screenMode` to `Screen Splitting`, at which point `med
 
 `ryuo_ctl.py` sends a single request and pretty-prints whatever comes back. Handy for poking at things.
 
-On its own it changes nothing durably — there's no keepalive, so the screen
-reverts ~10 s later. To change a *live* session, run it alongside
-`ryuo_send.py`; both can hold the hidraw node at once. Each one then also
-receives the other's replies, and skips them by `AckNumber` — `ryuo_ctl.py`
-says how many it skipped.
+In service mode, use supported commands such as brightness, items, info and ls while the worker holds the session. Direct protocol diagnostics require stopping the service and any standalone telemetry loop first. A direct command has no keepalive, so the screen reverts after about ten seconds.
 
 ```bash
 python ryuo_ctl.py get config
@@ -389,7 +404,8 @@ It deletes every file you didn't name, so run `ls` first.
 | --- | --- |
 | `ryuo_proto.py` | The wire format: framing, checksum, byte-stuffing, and every payload schema. No I/O — import it and build your own thing. |
 | `ryuo_hid.py` | The write/read loop the scripts share: one report out, then read until the reply *to that request* arrives. Works with any hidapi-style handle. |
-| `ryuo_send.py` | The daemon. Pushes config, then loops telemetry + colour animation. |
+| `ryuo_send.py` | CLI for service settings and standalone telemetry sessions. |
+| `ryuo_screen/daemon.py` | Linux system service, device worker and API composition. |
 | `ryuo_ctl.py` | Single-shot request/response tool for exploring. |
 | `PROTOCOL.md` | Full protocol writeup. |
 | `70-ryuo.rules` | udev rule so you don't have to run as root. The number is load-bearing — `uaccess` tags are only honoured by rule files sorting before systemd's `73-seat-late.rules`. |
@@ -470,8 +486,8 @@ If you're writing your own client in another language, `ryuo_proto.py` + `PROTOC
 * **Four readouts have no tile in ASUS's picker at all** — `GPU Power`,
   `Memory Utilization`, `Memory Frequency` and `Hard Disk Temperature`. All
   four render perfectly; Info Hub simply never offers them.
-* **GPU stats are NVIDIA-only** right now, via `nvidia-smi`. AMD would want a `sysfs`/`amdgpu` path in `_nvidia()`'s place. PRs welcome.
-* **CPU temperature and fan speeds are Linux-only.** Both come from `psutil`,
+* **GPU coverage depends on the entry point.** The Linux service supports native AMD telemetry and NVIDIA via `nvidia-smi`. The standalone legacy loop uses `nvidia-smi` for GPU readings.
+* **Standalone CPU temperature and fan speeds are Linux-only.** Both come from `psutil`,
   which only reads hardware sensors on Linux and FreeBSD. On Windows the
   `CPU Temperature` slot shows 0, and `Fan Speed …` slots get no data except
   what you pass with `--readout`. GPU temperature isn't affected: it comes from
@@ -538,8 +554,8 @@ route to a readout Info Hub cannot produce.
 ## Tests
 
 ```bash
-pip install pytest
-pytest tests/ -v                       # codec tests, no hardware needed
+python -m pip install -e '.[dev]'
+python -m pytest tests/ -v             # automated tests, no cooler needed
 ```
 
 `tests/test_proto.py` pins the wire format, including the worked example printed
@@ -569,12 +585,14 @@ working out it was an Android OTA, getting an adb root shell, decompiling
 `SerialMsgManager`, tracking down which USB device was actually the cooler,
 and testing every one of these behaviours on real hardware.
 
-The client code and this documentation were written through interactive
+The original reference client and protocol documentation were written through interactive
 prompting with an AI assistant and then verified against the device — that's
 [**Level 3 (Interactive)**](https://github.com/Essk/ai-contribution-level) on
 the AI contribution scale. Nothing in here is claimed to work that hasn't been
 run; anything I *haven't* confirmed is explicitly marked as untested in
 [PROTOCOL.md](PROTOCOL.md).
+
+The protocol and original reference client are by **FoxPodZ (foxpodz.de)**. The Linux service design draws on shorti1996’s work on device lifecycle, media handling and screen controls. The AMD and alternative screen projects served as interoperability references. [Original protocol project](https://github.com/foxpodz/ryuo-iv-screen) · [ryuo-display](https://github.com/shorti1996/ryuo-display) · [asus-ryuo-iv-linux](https://github.com/dragocz95/asus-ryuo-iv-linux) · [rog-studio](https://github.com/zleo-ai/rog-studio)
 
 ## Disclaimer
 
@@ -619,8 +637,8 @@ closed-source fan-control suite.
 **Not AGPL**, because AGPL puts a lot of people off, and engineers at companies
 whose policy bans it — Google's is the famous one — simply can't touch AGPL code
 even if they own this cooler and want to help. That's a real cost for a network
-clause that would never fire anyway: this is a local USB daemon talking to a
-water block, there is no network service to trigger it.
+clause that would never fire anyway: the original reference client used local USB
+to talk to a water block.
 
 **GPL v3 or later** is the middle: closed forks are out, contributors are in.
 

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Static settings. Restart ryuo-screen.service after editing.
+listen_host = "127.0.0.1"
+listen_port = 8746
+lan_enabled = false
+data_dir = "/var/lib/ryuo-screen"
+gpu_provider = "auto"
+# Select an AMD PCI BDF or an NVIDIA UUID/index from the sensors catalog.
+# gpu_selector = "0000:03:00.0"
+# See docs/security.md before enabling LAN access.

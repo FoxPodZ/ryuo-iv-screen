@@ -1,19 +1,33 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""aiohttp TCP and Unix-domain socket lifecycle helpers."""
+"""Run the Ryuo screen device worker and its HTTP and Unix-socket API."""
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import errno
 import os
+import signal
 import socket
 import stat
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 from aiohttp import web
 
+from .api import AppContext, create_app
 from .auth import SECURITY_KEY, SecurityPolicy
+from .device import DeviceWorker, HidTransport
+from .media import AdbBackend, MediaCatalog, MediaManager, MediaTools
+from .store import AppConfig, ProfileStore, StateStore
+from .telemetry.amd import AmdGpuProvider
+from .telemetry.collector import TelemetryCollector
+from .telemetry.cpu import CpuProvider
+from .telemetry.hwmon import HwmonProvider
+from .telemetry.nvidia import NvidiaProvider
+from .telemetry.sysfs import Sysfs
 
 
 DEFAULT_TCP = ("127.0.0.1", 8746)
@@ -157,4 +171,53 @@ async def run_sites(
     )
 
 
-__all__ = ["DEFAULT_TCP", "DEFAULT_UDS", "RunningSites", "run_sites"]
+async def serve(config: AppConfig, socket_path: Path, web_root: Optional[Path]) -> None:
+    policy = SecurityPolicy.from_config(config)
+    policy.validate_bind(config.listen_host)
+    sysfs = Sysfs()
+    preferred = config.gpu_provider if config.gpu_provider != "auto" else None
+    collector = TelemetryCollector((
+        CpuProvider(sysfs), HwmonProvider(sysfs, config.motherboard_sensor),
+        AmdGpuProvider(sysfs, config.gpu_selector if preferred != "nvidia" else None),
+        NvidiaProvider(config.gpu_selector if preferred != "amd" else None),
+    ), preferred)
+    state_store = StateStore(config.state_path)
+    worker = DeviceWorker(HidTransport(), collector, state_store.load())
+    media = MediaManager(
+        Path("/var/cache/ryuo-screen"), MediaTools(), AdbBackend(serial=os.getenv("ANDROID_SERIAL")),
+        worker, lambda: MediaCatalog.from_conn(worker.status().descriptor),
+    )
+    app = create_app(AppContext(
+        state_store, ProfileStore(config.profiles_dir), worker, collector,
+        media=media, security=policy, web_root=web_root,
+    ))
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    async with AsyncExitStack() as cleanup:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, shutdown.set)
+            cleanup.callback(loop.remove_signal_handler, sig)
+        worker.start()
+        cleanup.callback(worker.stop)
+        sites = await run_sites(app, (config.listen_host, config.listen_port), socket_path)
+        cleanup.push_async_callback(sites.stop)
+        await shutdown.wait()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=AppConfig.config_path,
+                        help="system TOML file (default: %(default)s)")
+    parser.add_argument("--socket", type=Path, default=DEFAULT_UDS,
+                        help="local control socket (default: %(default)s)")
+    parser.add_argument("--web-root", type=Path,
+                        help="directory containing the built Web UI (source checkout: web/dist)")
+    args = parser.parse_args()
+    asyncio.run(serve(AppConfig.load(args.config), args.socket, args.web_root))
+
+
+__all__ = ["DEFAULT_TCP", "DEFAULT_UDS", "RunningSites", "run_sites", "serve", "main"]
+
+
+if __name__ == "__main__":
+    main()

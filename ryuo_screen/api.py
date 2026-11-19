@@ -505,6 +505,14 @@ async def _get_device(request: web.Request) -> web.Response:
     return web.json_response(_device_document(context.device.status()))
 
 
+async def _resume_device(request: web.Request) -> web.Response:
+    if await _json_object(request):
+        raise ValueError("resume takes an empty JSON object")
+    context: AppContext = request.app[CONTEXT_KEY]
+    context.device.notify_resume()
+    return web.json_response({"queued": True}, status=202)
+
+
 def _media_manager(request: web.Request) -> MediaManager:
     context: AppContext = request.app[CONTEXT_KEY]
     if context.media is None:
@@ -774,6 +782,7 @@ def create_app(context: AppContext) -> web.Application:
     app.router.add_get(API_PREFIX + "/telemetry", _get_telemetry)
     app.router.add_get(API_PREFIX + "/sensors", _get_sensors)
     app.router.add_get(API_PREFIX + "/device", _get_device)
+    app.router.add_post(API_PREFIX + "/device/resume", _resume_device)
     app.router.add_get(API_PREFIX + "/events", _events)
     app.router.add_get(API_PREFIX + "/media", _get_media)
     app.router.add_post(API_PREFIX + "/media/upload", _upload_media)

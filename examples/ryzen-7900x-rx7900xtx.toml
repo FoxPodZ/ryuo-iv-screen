@@ -1,22 +1,20 @@
 # Ryzen 9 7900X / RX 7900 XTX / nct6799 example.
 # Replace this placeholder with the real PCI BDF reported by:
-#   curl http://127.0.0.1:9077/api/v1/sensors
-# or inspect: find /sys/bus/pci/devices -maxdepth 2 -name hwmon -print
+#   curl http://127.0.0.1:8746/api/v1/sensors
+# Copy the AMD PCI BDF from the selected sensor reference.
 gpu_provider = "amd"
 gpu_selector = "0000:XX:YY.Z"
 
 # Mutable state and profiles remain below this service-owned directory.
 data_dir = "/var/lib/ryuo-screen"
 listen_host = "127.0.0.1"
-listen_port = 9077
+listen_port = 8746
 
-# k10temp labels are discovered dynamically. Prefer Tdie and use Tctl only
-# when that is what /api/v1/sensors reports; never persist a hwmonN number.
-cpu_temperature_label = "Tdie"
+# k10temp labels are discovered automatically. See docs/telemetry.md.
 
 # Replace channel/device only with the stable reference returned by the API.
 # The nct6799 name is stable; /sys/class/hwmon/hwmonN is not.
 [motherboard_sensor]
 provider = "hwmon"
-device = "platform/nct6799"
+device = "platform/nct6775.656/nct6799"
 channel = "temp2"

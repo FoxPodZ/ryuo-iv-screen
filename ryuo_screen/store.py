@@ -129,7 +129,7 @@ class AppConfig:
     config_path: Path = Path("/etc/ryuo-screen/config.toml")
     data_dir: Path = Path("/var/lib/ryuo-screen")
     listen_host: str = "127.0.0.1"
-    listen_port: int = 9077
+    listen_port: int = 8746
     gpu_provider: str = "auto"
     gpu_selector: Optional[str] = None
     motherboard_sensor: Optional[SensorRef] = None
@@ -192,7 +192,7 @@ class AppConfig:
             config_path=config_path,
             data_dir=Path(document.get("data_dir", "/var/lib/ryuo-screen")),
             listen_host=document.get("listen_host", "127.0.0.1"),
-            listen_port=document.get("listen_port", 9077),
+            listen_port=document.get("listen_port", 8746),
             gpu_provider=document.get("gpu_provider", "auto"),
             gpu_selector=document.get("gpu_selector"),
             motherboard_sensor=motherboard,

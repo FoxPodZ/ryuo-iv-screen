@@ -29,6 +29,9 @@ class Device:
     def __init__(self):
         self.commands = []
 
+    def notify_resume(self):
+        self.commands.append("resume")
+
     def status(self):
         return DeviceStatus(phase="healthy", connected=True)
 
@@ -638,5 +641,22 @@ async def test_diagnostics_distinguish_lan_policy_without_disclosing_secrets(tmp
         for secret in (verifier, session.token, session.csrf_token, "private-password"):
             assert secret not in json.dumps(remote)
         assert forwarded.headers["Cache-Control"] == "no-store"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_requires_session_and_csrf_before_notifying_worker(tmp_path):
+    client, context, device = await _client(tmp_path, _lan_policy())
+    headers = {"Host": "192.168.1.50", "X-Forwarded-For": "192.168.1.70"}
+    path = "/api/v1/device/resume"
+    try:
+        assert (await client.post(path, headers=headers, json={})).status == 401
+        login = await client.post("/api/v1/auth/login", headers=headers, json={"password": "secret-password"})
+        assert (await client.post(path, headers=headers, json={})).status == 403
+        headers["X-CSRF-Token"] = (await login.json())["csrfToken"]
+        assert (await client.post(path, headers=headers, json={})).status == 202
+        assert device.commands == ["resume"]
+        assert context.state.revision == 1
     finally:
         await client.close()
