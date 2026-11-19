@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from ryuo_screen.media import (
-    AdbBackend, MediaBusy, MediaCatalog, MediaInfo, MediaJob, MediaManager,
+    AdbAvailability, AdbBackend, MediaBusy, MediaCatalog, MediaInfo, MediaJob, MediaManager,
     MediaTools,
 )
 
@@ -52,7 +52,11 @@ class FakeAdb:
         self.outcome = outcome
         self.calls = []
 
-    def push(self, source, name):
+    def available(self):
+        return AdbAvailability(True, serial="A")
+
+    def push(self, source, name, *, target):
+        assert target == self.available()
         self.calls.append((Path(source), name))
         return self.outcome
 
@@ -368,3 +372,37 @@ async def test_media_manager_bounds_active_jobs_and_terminal_result_retention(tm
     assert len(manager.jobs) == 2
     assert results[0].job_id not in manager.jobs
     assert list(manager.jobs) == [results[1].job_id, results[2].job_id]
+
+
+@pytest.mark.asyncio
+async def test_upload_never_retargets_after_a_second_cooler_replaces_the_first(tmp_path, monkeypatch):
+    from ryuo_screen import media
+
+    usb = tmp_path / "usb"
+    port = usb / "1-3"
+    port.mkdir(parents=True)
+    (port / "idVendor").write_text("0b05")
+    (port / "idProduct").write_text("1c76")
+    serial = port / "serial"
+    serial.write_text("FIRST")
+    monkeypatch.setattr(media, "USB_DEVICES", usb)
+    pushes = []
+
+    def run(argv, **kwargs):
+        if argv[1:] == ["devices", "-l"]:
+            current = serial.read_text()
+            transport = "7" if current == "FIRST" else "9"
+            return Result("List of devices attached\n{} device usb:1-3 transport_id:{}\n".format(current, transport))
+        pushes.append(argv)
+        return Result()
+
+    class ReconnectDuringUpload(Stream):
+        async def read(self, size):
+            serial.write_text("SECOND")
+            return await super().read(size)
+
+    backend = AdbBackend(runner=run, which=lambda _: "adb")
+    job = MediaJob(tmp_path / "jobs", FakeTools(), backend, lambda: MediaCatalog())
+    result = await job.run(ReconnectDuringUpload([b"media"]))
+    assert not result.applied
+    assert pushes == []

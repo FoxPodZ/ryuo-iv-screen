@@ -105,3 +105,28 @@ def test_operator_guides_cover_registered_api():
     for name in ("api", "deployment", "security", "telemetry", "web-ui"):
         assert (ROOT / ("docs/" + name + ".md")).is_file()
         assert "docs/" + name + ".md" in readme
+
+
+def test_installer_resolves_and_builds_all_wheels_before_stopping_service():
+    script = (ROOT / "scripts/install.sh").read_text()
+    prepare = 'python3 -m pip wheel --wheel-dir "$wheels" "$src"'
+    assert prepare in script
+    assert script.index(prepare) < script.index("systemctl stop ryuo-screen.service")
+    assert '--no-index --find-links "$wheels"' in script
+
+
+def test_checkout_overlap_checked_before_runtime_or_service_changes():
+    script = (ROOT / "scripts/install.sh").read_text()
+    guard = 'if [ "$src" = "$destination" ]'
+    assert guard in script
+    assert "exit 1" in script[script.index(guard):script.index("getent group")]
+    assert script.index(guard) < script.index("systemctl stop ryuo-screen.service")
+
+
+def test_failed_runtime_replacement_restores_old_paths_and_service_activity():
+    script = (ROOT / "scripts/install.sh").read_text()
+    assert "systemctl is-active --quiet ryuo-screen.service" in script
+    assert "trap finish 0" in script
+    assert 'restore_runtime "$prefix/venv"' in script
+    assert 'restore_runtime "$prefix/web/dist"' in script
+    assert 'if [ "$was_active" = yes ]; then' in script

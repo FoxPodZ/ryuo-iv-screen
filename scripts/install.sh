@@ -4,27 +4,98 @@ set -eu
 umask 022
 [ "$(id -u)" = 0 ] || { echo "Run the installer as root." >&2; exit 1; }
 [ "$#" = 0 ] || { echo "Usage: install.sh" >&2; exit 2; }
-src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 prefix=/opt/ryuo-screen
 unit=/etc/systemd/system/ryuo-screen.service
 [ -r "$src/web/dist/index.html" ] && [ -d "$src/web/dist/assets" ] || {
     echo "Build the Web UI in web/ before installing." >&2; exit 1;
 }
 
+# The installed runtime is replaced in place. Resolve symlinked checkouts too.
+destination=$(realpath -m -- "$prefix")
+if [ "$src" = "$destination" ] || [ "$(realpath -- "$src/web/dist")" = "$(realpath -m -- "$prefix/web/dist")" ]; then
+    echo "Use a source checkout outside the installed runtime and Web bundle." >&2
+    exit 1
+fi
+case "$src/" in
+    "$destination/venv/"*|"$destination/web/dist/"*)
+        echo "The source checkout is inside the runtime being replaced." >&2; exit 1 ;;
+esac
+
+# Resolve, download and build the project and every dependency while the old
+# service is still running. After cutover starts pip can use local wheels only.
+wheels=$(mktemp -d)
+trap 'rm -rf -- "$wheels"' 0
+trap 'exit 1' HUP INT TERM
+python3 -m pip wheel --wheel-dir "$wheels" "$src"
+
 getent group ryuo-screen >/dev/null || groupadd --system ryuo-screen
 id ryuo-screen >/dev/null 2>&1 || useradd --system --gid ryuo-screen \
     --home-dir /var/lib/ryuo-screen --no-create-home --shell /usr/sbin/nologin ryuo-screen
 install -d -m 0755 "$prefix" "$prefix/web"
 mkdir -p /etc/systemd/system /etc/tmpfiles.d /etc/udev/rules.d
-if systemctl cat ryuo-screen.service >/dev/null 2>&1; then
-    systemctl stop ryuo-screen.service
-fi
-
 # Keep the previous unit and all operator data together, accessible only to root.
 install -d -m 0700 /var/backups/ryuo-screen
 backup=$(mktemp -d /var/backups/ryuo-screen/install.XXXXXXXX)
 echo "Pre-install backup: $backup"
-for path in "$unit" "$unit.d" /etc/ryuo-screen /var/lib/ryuo-screen /etc/udev/rules.d/70-ryuo.rules /etc/tmpfiles.d/ryuo-screen.conf; do
+was_active=no
+if systemctl is-active --quiet ryuo-screen.service; then
+    was_active=yes
+fi
+replace_venv=no
+replace_web=no
+replace_files=no
+rule=/etc/udev/rules.d/70-ryuo.rules
+tmpfiles=/etc/tmpfiles.d/ryuo-screen.conf
+marker=/opt/ryuo-screen/.installed
+config=/etc/ryuo-screen/config.toml
+created_config=no
+
+restore_runtime() {
+    rm -rf -- "$1" || return 1
+    if [ -e "$backup$1" ] || [ -L "$backup$1" ]; then
+        mv -T -- "$backup$1" "$1"
+    fi
+}
+
+finish() {
+    status=$?
+    trap - 0 HUP INT TERM
+    if [ "$status" -ne 0 ]; then
+        # Continue independent recovery steps if restoring a rule or reloading
+        # udev also fails (for example when the service bus is unavailable).
+        set +e
+        echo "Install failed. Restoring the previous deployment from $backup." >&2
+        if [ "$replace_files" = yes ]; then
+            if systemctl cat ryuo-screen.service >/dev/null 2>&1; then
+                systemctl stop ryuo-screen.service
+            fi
+            for path in "$unit" "$rule" "$tmpfiles" "$marker"; do
+                if [ -e "$backup$path" ] || [ -L "$backup$path" ]; then
+                    cp -aT --remove-destination -- "$backup$path" "$path"
+                else
+                    rm -f -- "$path"
+                fi
+            done
+            if [ "$created_config" = yes ]; then rm -f -- "$config"; fi
+            systemctl daemon-reload
+            udevadm control --reload-rules
+        fi
+        if [ "$replace_venv" = yes ]; then restore_runtime "$prefix/venv"; fi
+        if [ "$replace_web" = yes ]; then restore_runtime "$prefix/web/dist"; fi
+        if [ "$was_active" = yes ]; then
+            systemctl start ryuo-screen.service
+        fi
+    fi
+    rm -rf -- "$wheels"
+    exit "$status"
+}
+trap finish 0
+if systemctl cat ryuo-screen.service >/dev/null 2>&1; then
+    systemctl stop ryuo-screen.service
+fi
+
+for path in "$unit" "$unit.d" /etc/ryuo-screen /var/lib/ryuo-screen "$rule" "$tmpfiles" "$marker"; do
     if [ -e "$path" ] || [ -L "$path" ]; then
         cp -a --parents -- "$path" "$backup"
     fi
@@ -36,17 +107,23 @@ install -d -m 0700 "$backup/opt/ryuo-screen/web"
 if [ -e "$prefix/venv" ] || [ -L "$prefix/venv" ]; then
     mv -- "$prefix/venv" "$backup/opt/ryuo-screen/venv"
 fi
+replace_venv=yes
 if [ -e "$prefix/web/dist" ] || [ -L "$prefix/web/dist" ]; then
     mv -- "$prefix/web/dist" "$backup/opt/ryuo-screen/web/dist"
 fi
+replace_web=yes
 python3 -m venv "$prefix/venv"
-"$prefix/venv/bin/python" -m pip install --disable-pip-version-check "$src"
+"$prefix/venv/bin/python" -m pip install --no-index --find-links "$wheels" ryuo-iv-screen
 install -d -m 0755 "$prefix/web/dist" "$prefix/web/dist/assets"
 install -m 0644 "$src"/web/dist/assets/* "$prefix/web/dist/assets/"
 install -m 0644 "$src/web/dist/index.html" "$prefix/web/dist/index.html"
 install -m 0644 "$src/LICENSE" "$src/LICENSE-ADDITIONAL-TERMS.md" "$prefix/"
-install -d -o root -g ryuo-screen -m 0750 /etc/ryuo-screen
-if [ ! -e /etc/ryuo-screen/config.toml ]; then
+replace_files=yes
+if [ ! -d /etc/ryuo-screen ]; then
+    install -d -o root -g ryuo-screen -m 0750 /etc/ryuo-screen
+fi
+if [ ! -e /etc/ryuo-screen/config.toml ] && [ ! -L /etc/ryuo-screen/config.toml ]; then
+    created_config=yes
     install -o root -g ryuo-screen -m 0640 "$src/packaging/config.toml" /etc/ryuo-screen/config.toml
 fi
 install -m 0644 "$src/70-ryuo.rules" /etc/udev/rules.d/70-ryuo.rules
@@ -56,5 +133,6 @@ install -m 0644 /dev/null /opt/ryuo-screen/.installed
 systemd-tmpfiles --create /etc/tmpfiles.d/ryuo-screen.conf
 udevadm control --reload-rules
 systemctl daemon-reload
-systemctl enable --now ryuo-screen.service
+systemctl start ryuo-screen.service
+systemctl enable ryuo-screen.service
 echo "Replug the cooler to apply USB permissions. See docs/deployment.md."

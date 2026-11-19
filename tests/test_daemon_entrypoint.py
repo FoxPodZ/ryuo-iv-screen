@@ -75,3 +75,56 @@ async def test_service_loads_state_serves_both_sites_and_stops_on_sigterm(tmp_pa
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+@pytest.mark.parametrize("vendor", ["0b05", "1c75"])
+def test_auto_adb_pins_matching_physical_cooler_and_refuses_replacement(tmp_path, monkeypatch, vendor):
+    from ryuo_screen import media
+
+    usb = tmp_path / "usb"
+    cooler = usb / "1-2.3"
+    cooler.mkdir(parents=True)
+    (cooler / "idVendor").write_text(vendor)
+    (cooler / "idProduct").write_text("1c76")
+    (cooler / "serial").write_text("COOLER")
+    monkeypatch.setattr(media, "USB_DEVICES", usb, raising=False)
+    devices = ["COOLER device usb:1-2.3 product:cm16 transport_id:37"]
+    transfers = []
+
+    def adb(argv, **kwargs):
+        if argv[1:] == ["devices", "-l"]:
+            output = "List of devices attached\n" + "\n".join(devices)
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        transfers.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = media.AdbBackend(which=lambda _: "adb", runner=adb)
+    assert backend.available().serial == "COOLER"
+    assert backend.push(tmp_path / "clip.mp4", "user.mp4")
+    assert transfers == [["adb", "-t", "37", "push", str(tmp_path / "clip.mp4"),
+                          "/sdcard/pcMedia/user.mp4"]]
+    # A different device is now authorized, even with the same USB port or serial.
+    for replacement in (
+        "emulator-5554 device transport_id:38",
+        "PHONE device usb:1-2.3 transport_id:38",
+        "COOLER device usb:2-1 transport_id:38",
+        "COOLER device usb:1-2.3",
+    ):
+        devices[:] = [replacement]
+        assert not backend.available().available
+        assert not backend.push(tmp_path / "clip.mp4", "user.mp4")
+    assert len(transfers) == 1
+
+
+def test_auto_adb_rejects_lone_unidentified_android_device(tmp_path, monkeypatch):
+    from ryuo_screen import media
+
+    monkeypatch.setattr(media, "USB_DEVICES", tmp_path, raising=False)
+    ran = []
+    def adb(argv, **kwargs):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "List of devices attached\nOTHER device transport_id:1\n", "")
+
+    backend = media.AdbBackend(which=lambda _: "adb", runner=adb)
+    assert not backend.push(tmp_path / "clip", "user.mp4")
+    assert ran == [["adb", "devices", "-l"]]

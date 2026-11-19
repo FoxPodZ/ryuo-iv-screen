@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,7 @@ from .device import DeviceCommand
 from .models import CommandResult
 
 
+USB_DEVICES = Path("/sys/bus/usb/devices")
 REMOTE_MEDIA_DIR = "/sdcard/pcMedia"
 REMOTE_FACTORY_MEDIA_DIR = "/sdcard/pcMediaPreset"
 MAX_THUMBNAIL = (640, 360)
@@ -274,6 +276,35 @@ class AdbAvailability:
     available: bool
     reason: Optional[str] = None
     serial: Optional[str] = None
+    transport_id: Optional[str] = None
+
+    def target_args(self) -> Tuple[str, str]:
+        if self.transport_id is not None:
+            return "-t", self.transport_id
+        if self.serial is None:
+            raise ValueError("no ADB target selected")
+        return "-s", self.serial
+
+
+def _cooler_usb_identity() -> Optional[Tuple[str, str]]:
+    """Return the unique Ryuo USB port and serial visible to the daemon."""
+    identities = []
+    try:
+        for node in USB_DEVICES.iterdir():
+            if not re.fullmatch(r"[0-9]+-[0-9]+(?:\.[0-9]+)*", node.name):
+                continue
+            vendor = int((node / "idVendor").read_text("ascii").strip(), 16)
+            if vendor not in proto.VIDS:
+                continue
+            product = int((node / "idProduct").read_text("ascii").strip(), 16)
+            if product == proto.PID:
+                serial = (node / "serial").read_text("utf-8").strip()
+                if not serial:
+                    return None
+                identities.append((node.name, serial))
+    except (OSError, ValueError):
+        return None
+    return identities[0] if len(identities) == 1 else None
 
 
 class AdbBackend:
@@ -307,35 +338,43 @@ class AdbBackend:
             return AdbAvailability(False, str(exc) or exc.__class__.__name__, self.serial)
         if getattr(result, "returncode", 0) != 0:
             return AdbAvailability(False, getattr(result, "stderr", "adb failed"))
-        devices = []
-        for line in str(getattr(result, "stdout", "")).splitlines()[1:]:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            devices.append((parts[0], parts[1] if len(parts) > 1 else "unknown"))
+        devices = [line.split() for line in str(result.stdout).splitlines()[1:] if line.strip()]
         if self.serial is not None:
-            matches = [item for item in devices if item[0] == self.serial]
-            if len(matches) != 1 or matches[0][1] != "device":
+            matches = [parts for parts in devices if parts[0] == self.serial]
+            if len(matches) != 1 or matches[0][1:2] != ["device"]:
                 return AdbAvailability(False, "selected ADB device is unavailable", self.serial)
             return AdbAvailability(True, serial=self.serial)
-        ready = [item for item in devices if item[1] == "device"]
-        if not ready:
-            return AdbAvailability(False, "no authorized ADB device")
-        if len(ready) != 1:
-            return AdbAvailability(False, "multiple ADB devices; configure a serial")
-        return AdbAvailability(True, serial=ready[0][0])
 
-    def push(self, source: Path, name: str) -> bool:
+        physical = [parts for parts in devices if parts[1:2] == ["device"]
+                    and any(field.startswith("usb:") for field in parts[2:])]
+        identity = _cooler_usb_identity() if physical else None
+        if identity is not None:
+            port, serial = identity
+            matches = [
+                parts for parts in physical
+                if parts[0] == serial and "usb:" + port in parts[2:]
+            ]
+            if len(matches) == 1:
+                ids = [field.partition(":")[2] for field in matches[0][2:]
+                       if field.startswith("transport_id:")]
+                if len(ids) == 1 and re.fullmatch(r"[1-9][0-9]*", ids[0]):
+                    return AdbAvailability(True, serial=serial, transport_id=ids[0])
+        return AdbAvailability(False, "cannot identify the Ryuo USB transport; configure ANDROID_SERIAL")
+
+    def push(
+        self, source: Path, name: str, *, target: Optional[AdbAvailability] = None,
+    ) -> bool:
         proto.check_media_name(name)
         availability = self.available()
+        if target is not None and availability != target:
+            return False
         if not availability.available or availability.serial is None:
             return False
         tool = self._tool()
         assert tool is not None
         try:
             result = self._runner([
-                tool, "-s", availability.serial, "push", str(Path(source)),
+                tool, *availability.target_args(), "push", str(Path(source)),
                 REMOTE_MEDIA_DIR + "/" + name,
             ], capture_output=True, text=True, timeout=self._timeout)
         except (OSError, subprocess.SubprocessError):
@@ -357,7 +396,7 @@ class AdbBackend:
         destination = Path(destination)
         remote_root = REMOTE_FACTORY_MEDIA_DIR if factory else REMOTE_MEDIA_DIR
         argv = [
-            tool, "-s", availability.serial, "pull",
+            tool, *availability.target_args(), "pull",
             remote_root + "/" + name, str(destination),
         ]
         process = None
@@ -458,6 +497,9 @@ class MediaJob:
     async def run(self, stream: Any, original_name: str = "upload") -> MediaJobResult:
         # original_name is deliberately never used in a path or command.
         del original_name
+        target = await _call_sync(self.adb.available)
+        if not target.available:
+            return MediaJobResult(self.job_id, None, False, False, target.reason)
         self.temp_root.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix="job-", dir=str(self.temp_root)))
         source = directory / "source.upload"
@@ -488,7 +530,7 @@ class MediaJob:
                 await _call_sync(self.tools.convert, source, output, plan, self.max_bytes)
             if output.stat().st_size > self.max_bytes:
                 raise ValueError("converted media exceeds size limit")
-            pushed = await _call_sync(self.adb.push, output, name)
+            pushed = await _call_sync(self.adb.push, output, name, target=target)
             if not pushed:
                 return MediaJobResult(self.job_id, name, False, False, "ADB push failed")
             refreshed = self.refresh_catalog()

@@ -76,7 +76,8 @@ class Adb:
     def available(self):
         return type("Availability", (), {"available": True, "reason": None, "serial": "A"})()
 
-    def push(self, source, name):
+    def push(self, source, name, *, target):
+        assert target.serial == "A"
         if self.success and self.refresh:
             self.device.custom.append(name)
         return self.success
