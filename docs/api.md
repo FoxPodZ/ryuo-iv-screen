@@ -63,16 +63,22 @@ Profiles use the screen fields and schema version above plus `slug`, `name` and 
 
 | Request | Body and success response |
 | --- | --- |
-| `GET /api/v1/media` | `{factory:[names],custom:[names],tools:{ffprobe,ffmpeg},adb:{available,reason,serial}}`. Media names come from the last device `conn` descriptor. |
-| `POST /api/v1/media/upload` | Raw file body, `application/octet-stream`, optional descriptive `X-Filename`. The server generates the remote basename and returns 201 for confirmed delivery. |
+| `GET /api/v1/media` | `{factory:[names],custom:[names],tools:{ffprobe,ffmpeg},adb:{available,reason,serial,targetToken?}}`. Media names come from the last device `conn` descriptor. |
+| `POST /api/v1/media/upload` | Raw file body, `application/octet-stream`, optional descriptive `X-Filename`. For automatic ADB selection send the `X-Ryuo-Media-Target` header from the media listing. The server generates the remote basename and returns 201 for confirmed delivery. |
 | `GET /api/v1/media/jobs/{job_id}` | Stored job result from this process. Completed results are bounded and expire by eviction or restart. |
 | `GET /api/v1/media/preview/{kind}/{name}` | `thumbnail` gives a JPEG. `proxy` gives a bounded MP4. Requires a listed name, ADB and media tools. |
 | `DELETE /api/v1/media/{name}` | Delete one custom file through the worker. Returns 200 after acknowledgement and refreshed listing. Factory files are protected. |
 
-Upload and delete return `{jobId,name,applied,confirmed,error}`. Upload selects the ADB target before processing the body, checks it again before transfer, and waits for validation, conversion if needed, ADB push and a refreshed listing. With automatic selection, the USB port and serial must identify the single physical cooler, and the same ADB transport must still be authorized when the transfer starts. HTTP 502 with `confirmed:false` means the operation could not be verified. Inspect the catalog before retrying. Uploads are limited to 256 MiB with a 30-second idle timeout. The media manager admits two concurrent operations.
+Upload and delete return `{jobId,name,applied,confirmed,error}`. In automatic mode, `GET /api/v1/media` returns an opaque `adb.targetToken` for the verified USB attachment. Send that exact value on POST. A missing, incorrect or stale token returns 409 `media_target_changed`. Refresh the listing and confirm the displayed target before starting a new upload. The token is kept only in memory and is independent of session authentication and CSRF. Explicit `ANDROID_SERIAL` selection omits the token and accepts an upload without the header.
+
+Upload verifies the target before processing the body, checks it again before transfer, and waits for validation, conversion if needed, ADB push and a refreshed listing. With automatic selection, the USB port and serial must identify the single physical cooler, and the same ADB transport must still be authorized when the transfer starts. HTTP 502 with `confirmed:false` means the operation could not be verified. Inspect the catalog before retrying. Uploads are limited to 256 MiB with a 30-second idle timeout. The media manager admits two concurrent operations.
 
 ```sh
-curl -H 'Content-Type: application/octet-stream' --data-binary @clip.mp4 \
+media_status=$(curl -fsS http://127.0.0.1:8746/api/v1/media)
+printf '%s' "$media_status" | python3 -m json.tool
+# Confirm the displayed ADB target before starting the transfer.
+target=$(printf '%s' "$media_status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["adb"].get("targetToken", ""))')
+curl -H "X-Ryuo-Media-Target: $target" -H 'Content-Type: application/octet-stream' --data-binary @clip.mp4 \
   http://127.0.0.1:8746/api/v1/media/upload
 ```
 

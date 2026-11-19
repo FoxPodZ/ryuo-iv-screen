@@ -2,7 +2,11 @@
 import configparser
 import re
 import shlex
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from ryuo_screen.store import AppConfig
 
@@ -67,7 +71,7 @@ def test_permissions_match_hid_interface_and_both_usb_ids():
 
 def test_installer_preserves_legacy_venv_before_building_at_fixed_prefix():
     installer = (ROOT / "scripts/install.sh").read_text()
-    backup = 'mv -- "$prefix/venv" "$backup/opt/ryuo-screen/venv"'
+    backup = 'save_runtime "$prefix/venv" "$venv_hold"'
     assert backup in installer
     assert installer.index(backup) < installer.index('python3 -m venv "$prefix/venv"')
 
@@ -117,7 +121,7 @@ def test_installer_resolves_and_builds_all_wheels_before_stopping_service():
 
 def test_checkout_overlap_checked_before_runtime_or_service_changes():
     script = (ROOT / "scripts/install.sh").read_text()
-    guard = 'if [ "$src" = "$destination" ]'
+    guard = 'if overlap "$source_path" "$destination"'
     assert guard in script
     assert "exit 1" in script[script.index(guard):script.index("getent group")]
     assert script.index(guard) < script.index("systemctl stop ryuo-screen.service")
@@ -130,3 +134,100 @@ def test_failed_runtime_replacement_restores_old_paths_and_service_activity():
     assert 'restore_runtime "$prefix/venv"' in script
     assert 'restore_runtime "$prefix/web/dist"' in script
     assert 'if [ "$was_active" = yes ]; then' in script
+
+
+class InstallerFixture:
+    """Run a path-relocated installer with a private, allowlisted command path."""
+
+    def __init__(self, root):
+        self.root = root
+        self.prefix = root / "opt/ryuo-screen"
+        self.src = root / "checkout"
+        self.log = root / "calls"
+        self.log.touch()
+        self.active = root / "active"
+        self.active.touch()
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        (self.prefix / "venv/bin").mkdir(parents=True)
+        (self.prefix / "venv/bin/python").write_text("old interpreter")
+        (self.prefix / "web/dist").mkdir(parents=True)
+        (self.prefix / "web/dist/index.html").write_text("old UI")
+        (self.src / "web/dist/assets").mkdir(parents=True)
+        (self.src / "web/dist/index.html").write_text("new UI")
+        scripts = self.src / "scripts"
+        scripts.mkdir()
+        self.script = scripts / "install.sh"
+        # Every system destination in this copy points inside the fixture.
+        self.script.write_text(re.sub(r"/(?=opt/|etc/|var/)", str(root) + "/",
+                                      (ROOT / "scripts/install.sh").read_text()))
+        for name in ("dirname", "realpath", "mktemp", "mkdir", "rm", "cp", "rmdir", "touch"):
+            (self.bin / name).symlink_to(shutil.which(name))
+        self.stub("id", '[ "$1" != -u ] || echo 0')
+        self.stub("getent", "exit 0")
+        self.stub("install", 'exec /usr/bin/install "$@"')
+        self.stub("python3", 'echo "python $*" >> "$LOG"\n[ "$1 $2" = "-m pip" ]')
+        self.stub("systemctl", '''echo "systemctl $*" >> "$LOG"
+case "$1" in
+    stop) rm -f "$ACTIVE" ;;
+    start) [ -f "$PREFIX/venv/bin/python" ] && [ -f "$PREFIX/web/dist/index.html" ] && touch "$ACTIVE" ;;
+    is-active) [ -f "$ACTIVE" ] ;;
+esac''')
+        # Deliver the signal while the installer shell is waiting for mv.
+        # The file move has completed, but its next statement has not run.
+        self.stub("mv", '''last=; prior=
+for arg do prior=$last; last=$arg; done
+if [ "$prior" = "$INJECT_PATH" ] && [ "$INJECT_WHEN" = before ]; then
+    echo injected >> "$LOG"; kill "-$INJECT_SIGNAL" "$PPID"; exit 1
+fi
+/usr/bin/mv "$@" || exit 1
+if [ "$prior" = "$INJECT_PATH" ]; then
+    echo injected >> "$LOG"; kill "-$INJECT_SIGNAL" "$PPID"
+fi''')
+
+    def stub(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+
+    def run(self, resource="", signal="TERM", when="after"):
+        return subprocess.run(
+            ["/bin/sh", str(self.script)], cwd=self.src,
+            env={"PATH": str(self.bin), "TMPDIR": str(self.root), "LOG": str(self.log),
+                 "PREFIX": str(self.prefix), "ACTIVE": str(self.active),
+                 "INJECT_PATH": str(self.prefix / resource) if resource else "",
+                 "INJECT_SIGNAL": signal, "INJECT_WHEN": when}, capture_output=True, text=True,
+            timeout=10,
+        )
+
+
+@pytest.mark.parametrize("resource", ["venv", "web/dist"])
+@pytest.mark.parametrize("signal", ["TERM", "INT"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_interrupted_move_restores_runtime_and_service(tmp_path, resource, signal, when):
+    fixture = InstallerFixture(tmp_path)
+    result = fixture.run(resource, signal, when)
+    calls = fixture.log.read_text()
+    assert result.returncode != 0 and "injected" in calls, (calls, result.stderr)
+    assert (fixture.prefix / "venv/bin/python").read_text() == "old interpreter"
+    assert (fixture.prefix / "web/dist/index.html").read_text() == "old UI"
+    assert "systemctl start" in calls and fixture.active.exists()
+
+
+@pytest.mark.parametrize("direction", ["source_inside_destination", "destination_inside_source"])
+def test_overlapping_symlinked_assets_rejected_before_any_service_or_build(tmp_path, direction):
+    fixture = InstallerFixture(tmp_path)
+    src = fixture.src / "web/dist"
+    dest = fixture.prefix / "web/dist"
+    if direction == "source_inside_destination":
+        shutil.move(str(src), str(dest / "source"))
+        src.symlink_to(dest / "source", target_is_directory=True)
+    else:
+        shutil.move(str(dest), str(src / "installed"))
+        dest.symlink_to(src / "installed", target_is_directory=True)
+    result = fixture.run()
+    assert result.returncode != 0
+    assert fixture.log.read_text() == "", result.stderr
+    assert fixture.active.exists()
+    assert (src / "index.html").read_text() == "new UI"
+    assert (dest / "index.html").read_text() == "old UI"

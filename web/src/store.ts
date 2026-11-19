@@ -226,7 +226,7 @@ export class AppStore {
         if (current()) this.update({upload: {phase: "uploading", percent}});
       }, () => {
         if (current()) this.update({upload: {phase: "processing"}});
-      });
+      }, this.state.media.adb.targetToken);
       const result = await this.transfer.result;
       if (!current()) return;
       if (result.confirmed !== true || !result.name) throw new Error("Сервер не подтвердил загрузку");

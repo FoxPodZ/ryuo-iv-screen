@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from pathlib import Path
 import asyncio
+import subprocess
 import time
 
 import pytest
@@ -8,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from ryuo_screen.api import AppContext, create_app
 from ryuo_screen.device import DeviceStatus, LatestTelemetry
-from ryuo_screen.media import MediaBusy, MediaCatalog, MediaManager
+from ryuo_screen.media import AdbAvailability, MediaBusy, MediaCatalog, MediaManager
 from ryuo_screen.models import CommandResult, TelemetrySnapshot
 from ryuo_screen.store import ProfileStore, ScreenState, StateStore
 
@@ -74,7 +75,7 @@ class Adb:
         self.refresh = refresh
 
     def available(self):
-        return type("Availability", (), {"available": True, "reason": None, "serial": "A"})()
+        return AdbAvailability(True, serial="A")
 
     def push(self, source, name, *, target):
         assert target.serial == "A"
@@ -183,7 +184,7 @@ async def test_media_preview_routes_and_busy_status_are_bounded(tmp_path):
         proxy_body = await proxy.read()
         missing = await client.get("/api/v1/media/preview/thumbnail/nope.png")
 
-        async def busy(stream, original_name):
+        async def busy(stream, original_name, target_token=None):
             raise MediaBusy("media job capacity is full")
 
         context.media.upload = busy
@@ -206,9 +207,7 @@ async def test_media_listing_does_not_block_event_loop_on_adb_probe(tmp_path):
 
     def slow_available():
         time.sleep(0.2)
-        return type("Availability", (), {
-            "available": True, "reason": None, "serial": "A",
-        })()
+        return AdbAvailability(True, serial="A")
 
     context.media.adb.available = slow_available
     ticks = 0
@@ -233,4 +232,75 @@ async def test_media_listing_does_not_block_event_loop_on_adb_probe(tmp_path):
             request_task.cancel()
         if not ticker_task.done():
             ticker_task.cancel()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_status_target_is_required_and_cannot_retarget_a_later_upload(tmp_path, monkeypatch):
+    from ryuo_screen import media
+
+    client, context, device = await _client(tmp_path)
+    port = tmp_path / "usb/1-3"
+    port.mkdir(parents=True)
+    (port / "idVendor").write_text("0b05")
+    (port / "idProduct").write_text("1c76")
+    serial = port / "serial"
+    serial.write_text("FIRST")
+    monkeypatch.setattr(media, "USB_DEVICES", port.parent)
+    pushes = []
+
+    def adb(argv, **kwargs):
+        if argv[1:] == ["devices", "-l"]:
+            current = serial.read_text()
+            tid = 7 if current == "FIRST" else 9
+            stdout = "List of devices attached\n{} device usb:1-3 transport_id:{}\n".format(current, tid)
+        else:
+            pushes.append(argv)
+            device.custom.append(Path(argv[-1]).name)
+            stdout = ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    context.media.adb = media.AdbBackend(runner=adb, which=lambda _: "adb")
+
+    async def status():
+        return (await (await client.get("/api/v1/media")).json())["adb"]
+
+    async def upload(token):
+        headers = {"Content-Type": "application/octet-stream"}
+        if token is not None:
+            headers["X-Ryuo-Media-Target"] = token
+        return await client.post("/api/v1/media/upload", headers=headers, data=b"image")
+
+    try:
+        first = await status()
+        assert first["serial"] == "FIRST"
+        first_token = first["targetToken"]
+        assert (await status())["targetToken"] == first_token
+        serial.write_text("SECOND")
+        assert (await upload(first_token)).status == 409
+        assert not pushes
+        second = await status()
+        second_token = second["targetToken"]
+        assert first_token and second_token != first_token
+        assert not any(part in second_token for part in ("SECOND", "1-3"))
+        for invalid in (None, "wrong", first_token):
+            assert (await upload(invalid)).status == 409
+        assert not pushes
+        assert (await upload(second_token)).status == 201
+        assert [argv[1:3] for argv in pushes] == [["-t", "9"]]
+        # Observing disappearance invalidates the token even if the next ADB
+        # server happens to reuse the same transport ID for the same device.
+        serial.write_text("")
+        assert not (await status())["available"]
+        serial.write_text("SECOND")
+        assert (await upload(second_token)).status == 409
+        fresh = await status()
+        assert fresh["targetToken"] != second_token
+        assert len(pushes) == 1
+        # The explicit operator selection continues to work without a status token.
+        context.media.adb.serial = "SECOND"
+        assert "targetToken" not in await status()
+        assert (await upload(None)).status == 201
+        assert pushes[-1][1:3] == ["-s", "SECOND"]
+    finally:
         await client.close()

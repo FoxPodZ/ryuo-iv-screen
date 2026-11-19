@@ -23,7 +23,7 @@ from .auth import (
     security_middleware,
 )
 from .device import DeviceCommand, LatestTelemetry
-from .media import MediaBusy, MediaManager, MediaOperationError, ToolUnavailable
+from .media import MediaBusy, MediaManager, MediaOperationError, MediaTargetChanged, ToolUnavailable
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
 from .store import (
     AppConfig,
@@ -457,6 +457,10 @@ async def _errors(request: web.Request, handler):
         return web.json_response(
             {"error": "tool_unavailable", "message": str(exc)}, status=503
         )
+    except MediaTargetChanged as exc:
+        return web.json_response(
+            {"error": "media_target_changed", "message": str(exc)}, status=409
+        )
     except MediaBusy as exc:
         return web.json_response(
             {"error": "media_busy", "message": str(exc)}, status=429
@@ -532,13 +536,15 @@ async def _get_media(request: web.Request) -> web.Response:
     document["tools"] = manager.tools.status()
     # ``adb devices`` may start the daemon and wait up to its bounded timeout;
     # never hold the aiohttp loop while it runs.
-    availability = await manager.adb_availability()
+    availability, target_token = await manager.adb_status()
     document["adb"] = {
         "available": bool(availability.available),
         "reason": availability.reason,
         "serial": availability.serial,
     }
-    return web.json_response(document)
+    if target_token is not None:
+        document["adb"]["targetToken"] = target_token
+    return web.json_response(document, headers={"Cache-Control": "no-store"})
 
 
 async def _upload_media(request: web.Request) -> web.Response:
@@ -546,7 +552,9 @@ async def _upload_media(request: web.Request) -> web.Response:
     # The name is metadata only. MediaJob never uses it for a local/remote path
     # or subprocess argument and generates its own destination basename.
     original_name = request.headers.get("X-Filename", "upload")
-    result = await manager.upload(request.content, original_name)
+    result = await manager.upload(
+        request.content, original_name, request.headers.get("X-Ryuo-Media-Target")
+    )
     return web.json_response(result.to_dict(), status=201 if result.confirmed else 502)
 
 

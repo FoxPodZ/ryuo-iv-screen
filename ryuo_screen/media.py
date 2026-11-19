@@ -47,6 +47,10 @@ class MediaBusy(RuntimeError):
     """The bounded media worker capacity is already in use."""
 
 
+class MediaTargetChanged(RuntimeError):
+    """The upload does not match the physical target shown in media status."""
+
+
 class MediaOperationError(RuntimeError):
     """A bounded external media operation failed."""
 
@@ -277,6 +281,7 @@ class AdbAvailability:
     reason: Optional[str] = None
     serial: Optional[str] = None
     transport_id: Optional[str] = None
+    usb_port: Optional[str] = None
 
     def target_args(self) -> Tuple[str, str]:
         if self.transport_id is not None:
@@ -358,7 +363,7 @@ class AdbBackend:
                 ids = [field.partition(":")[2] for field in matches[0][2:]
                        if field.startswith("transport_id:")]
                 if len(ids) == 1 and re.fullmatch(r"[1-9][0-9]*", ids[0]):
-                    return AdbAvailability(True, serial=serial, transport_id=ids[0])
+                    return AdbAvailability(True, serial=serial, transport_id=ids[0], usb_port=port)
         return AdbAvailability(False, "cannot identify the Ryuo USB transport; configure ANDROID_SERIAL")
 
     def push(
@@ -494,10 +499,14 @@ class MediaJob:
         self.chunk_size = int(chunk_size)
         self.job_id = uuid.uuid4().hex
 
-    async def run(self, stream: Any, original_name: str = "upload") -> MediaJobResult:
+    async def run(
+        self, stream: Any, original_name: str = "upload", *,
+        target: Optional[AdbAvailability] = None,
+    ) -> MediaJobResult:
         # original_name is deliberately never used in a path or command.
         del original_name
-        target = await _call_sync(self.adb.available)
+        if target is None:
+            target = await _call_sync(self.adb.available)
         if not target.available:
             return MediaJobResult(self.job_id, None, False, False, target.reason)
         self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -576,6 +585,8 @@ class MediaManager:
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_results = max_results
         self._active_jobs = 0
+        self._observed_target: Optional[AdbAvailability] = None
+        self._target_token: Optional[str] = None
         self.jobs: "OrderedDict[str, MediaJobResult]" = OrderedDict()
 
     def catalog(self) -> MediaCatalog:
@@ -584,8 +595,14 @@ class MediaManager:
             raise TypeError("catalog loader must return MediaCatalog")
         return value
 
-    async def adb_availability(self) -> AdbAvailability:
-        return await _call_sync(self.adb.available)
+    async def adb_status(self) -> Tuple[AdbAvailability, Optional[str]]:
+        target = await _call_sync(self.adb.available)
+        # A nonce identifies one observed USB attachment to this service.
+        # Lookups and token rotation run together on the API event loop.
+        if target != self._observed_target:
+            self._observed_target = target
+            self._target_token = uuid.uuid4().hex if target.available and target.transport_id else None
+        return target, self._target_token
 
     @asynccontextmanager
     async def _admit(self):
@@ -606,13 +623,18 @@ class MediaManager:
         while len(self.jobs) > self.max_results:
             self.jobs.popitem(last=False)
 
-    async def upload(self, stream: Any, original_name: str) -> MediaJobResult:
+    async def upload(
+        self, stream: Any, original_name: str, target_token: Optional[str] = None,
+    ) -> MediaJobResult:
         async with self._admit():
+            target, current_token = await self.adb_status()
+            if target_token != current_token:
+                raise MediaTargetChanged("refresh media status and confirm the current ADB target")
             job = MediaJob(
                 self.temp_root, self.tools, self.adb, self._refresh_conn_catalog,
                 max_bytes=self.max_bytes, idle_timeout=self.idle_timeout,
             )
-            result = await job.run(stream, original_name)
+            result = await job.run(stream, original_name, target=target)
             self._remember(result)
             return result
 

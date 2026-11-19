@@ -60,7 +60,7 @@ export async function setup(
       case "/api/v1/media": return json({
         factory: [filename], custom: ["user-one.mp4"],
         tools: {ffprobe: true, ffmpeg: available},
-        adb: {available, reason: available ? null : "ADB not available", serial: "adb-sensitive-serial"},
+        adb: {available, reason: available ? null : "ADB not available", serial: "adb-sensitive-serial", targetToken: available ? "observed-cooler" : undefined},
       });
       case "/api/v1/profiles": return json({profiles});
       case "/api/v1/diagnostics": return json({security, session: {required: true, authenticated: true, expiresIn: 58}});

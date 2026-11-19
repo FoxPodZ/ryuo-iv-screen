@@ -114,7 +114,7 @@ export class ApiClient {
 
   async loadMedia(): Promise<MediaCatalog> {
     const {factory, custom, tools, adb} = await this.request<MediaCatalog>("/media");
-    return {factory, custom, tools, adb: {available: adb.available, reason: adb.reason}};
+    return {factory, custom, tools, adb: {available: adb.available, reason: adb.reason, targetToken: adb.targetToken}};
   }
 
   async deleteMedia(name: string): Promise<MediaResult> {
@@ -125,6 +125,7 @@ export class ApiClient {
     file: File,
     onProgress: (percent: number | null) => void,
     onProcessing: () => void,
+    targetToken?: string,
   ): MediaTransfer {
     const extension = uploadExtension(file);
     if (!extension) throw new Error("Выберите файл MP4, GIF, PNG или JPG");
@@ -133,6 +134,7 @@ export class ApiClient {
     request.setRequestHeader("Content-Type", "application/octet-stream");
     request.setRequestHeader("Accept", "application/json");
     request.setRequestHeader("X-Filename", `upload.${extension}`);
+    if (targetToken) request.setRequestHeader("X-Ryuo-Media-Target", targetToken);
     if (this.csrfToken) request.setRequestHeader("X-CSRF-Token", this.csrfToken);
 
     let transmitting = true;

@@ -11,16 +11,23 @@ unit=/etc/systemd/system/ryuo-screen.service
     echo "Build the Web UI in web/ before installing." >&2; exit 1;
 }
 
-# The installed runtime is replaced in place. Resolve symlinked checkouts too.
-destination=$(realpath -m -- "$prefix")
-if [ "$src" = "$destination" ] || [ "$(realpath -- "$src/web/dist")" = "$(realpath -m -- "$prefix/web/dist")" ]; then
-    echo "Use a source checkout outside the installed runtime and Web bundle." >&2
-    exit 1
-fi
-case "$src/" in
-    "$destination/venv/"*|"$destination/web/dist/"*)
-        echo "The source checkout is inside the runtime being replaced." >&2; exit 1 ;;
-esac
+# Compare real path components in both directions, including an existing
+# destination symlink whose target is outside the installation prefix.
+overlap() {
+    case "$1/" in "${2%/}/"*) return 0 ;; esac
+    case "$2/" in "${1%/}/"*) return 0 ;; esac
+    return 1
+}
+for output in "$prefix" "$prefix/venv" "$prefix/web/dist"; do
+    destination=$(realpath -m -- "$output")
+    for input in "$src" "$src/web/dist" "$src/web/dist/assets" "$src/web/dist/index.html" "$src"/web/dist/assets/*; do
+        source_path=$(realpath -m -- "$input")
+        if overlap "$source_path" "$destination"; then
+            echo "Source $source_path overlaps installation path $destination." >&2
+            exit 1
+        fi
+    done
+done
 
 # Resolve, download and build the project and every dependency while the old
 # service is still running. After cutover starts pip can use local wheels only.
@@ -42,8 +49,8 @@ was_active=no
 if systemctl is-active --quiet ryuo-screen.service; then
     was_active=yes
 fi
-replace_venv=no
-replace_web=no
+venv_hold=
+web_hold=
 replace_files=no
 rule=/etc/udev/rules.d/70-ryuo.rules
 tmpfiles=/etc/tmpfiles.d/ryuo-screen.conf
@@ -51,16 +58,32 @@ marker=/opt/ryuo-screen/.installed
 config=/etc/ryuo-screen/config.toml
 created_config=no
 
-restore_runtime() {
-    rm -rf -- "$1" || return 1
-    if [ -e "$backup$1" ] || [ -L "$backup$1" ]; then
-        mv -T -- "$backup$1" "$1"
+# Each holder is a sibling of the path being replaced. rename(2) is atomic
+# on that filesystem. The presence of original is the rollback record, even
+# if the shell receives a signal before mv returns to this script.
+save_runtime() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        mv -T -- "$1" "$2/original"
+        cp -aT -- "$2/original" "$backup$1"
+    else
+        touch "$2/was-absent"
     fi
+}
+
+restore_runtime() {
+    [ -n "$2" ] || return 0
+    if [ -e "$2/original" ] || [ -L "$2/original" ]; then
+        rm -rf -- "$1" && mv -T -- "$2/original" "$1" || return 1
+    elif [ -f "$2/was-absent" ]; then
+        rm -rf -- "$1" || return 1
+    fi
+    rm -rf -- "$2"
 }
 
 finish() {
     status=$?
-    trap - 0 HUP INT TERM
+    trap '' HUP INT TERM
+    trap - 0
     if [ "$status" -ne 0 ]; then
         # Continue independent recovery steps if restoring a rule or reloading
         # udev also fails (for example when the service bus is unavailable).
@@ -81,11 +104,13 @@ finish() {
             systemctl daemon-reload
             udevadm control --reload-rules
         fi
-        if [ "$replace_venv" = yes ]; then restore_runtime "$prefix/venv"; fi
-        if [ "$replace_web" = yes ]; then restore_runtime "$prefix/web/dist"; fi
+        restore_runtime "$prefix/venv" "$venv_hold"
+        restore_runtime "$prefix/web/dist" "$web_hold"
         if [ "$was_active" = yes ]; then
             systemctl start ryuo-screen.service
         fi
+    else
+        rm -rf -- "$venv_hold" "$web_hold"
     fi
     rm -rf -- "$wheels"
     exit "$status"
@@ -104,14 +129,10 @@ done
 # A legacy ExecStart can use this same interpreter. Preserve its environment
 # at its original layout in the backup and install into a fresh directory.
 install -d -m 0700 "$backup/opt/ryuo-screen/web"
-if [ -e "$prefix/venv" ] || [ -L "$prefix/venv" ]; then
-    mv -- "$prefix/venv" "$backup/opt/ryuo-screen/venv"
-fi
-replace_venv=yes
-if [ -e "$prefix/web/dist" ] || [ -L "$prefix/web/dist" ]; then
-    mv -- "$prefix/web/dist" "$backup/opt/ryuo-screen/web/dist"
-fi
-replace_web=yes
+venv_hold=$(mktemp -d "$prefix/.previous.XXXXXXXX")
+web_hold=$(mktemp -d "$prefix/web/.previous.XXXXXXXX")
+save_runtime "$prefix/venv" "$venv_hold"
+save_runtime "$prefix/web/dist" "$web_hold"
 python3 -m venv "$prefix/venv"
 "$prefix/venv/bin/python" -m pip install --no-index --find-links "$wheels" ryuo-iv-screen
 install -d -m 0755 "$prefix/web/dist" "$prefix/web/dist/assets"

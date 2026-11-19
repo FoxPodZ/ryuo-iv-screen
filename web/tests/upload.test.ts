@@ -50,6 +50,7 @@ it("sends the raw file with safe metadata and confirms success only after the se
   expect(Transfer.current.headers.get("Content-Type")).toBe("application/octet-stream");
   expect(Transfer.current.headers.get("X-Filename")).toMatch(/^[A-Za-z0-9_.-]+$/);
   expect(Transfer.current.headers.get("X-CSRF-Token")).toBe("secret");
+  expect(Transfer.current.headers.get("X-Ryuo-Media-Target")).toBe("observed-cooler");
   Transfer.current.upload.dispatchEvent(new ProgressEvent("progress", {lengthComputable: true, loaded: 2, total: 5}));
   await vi.waitFor(() => expect(get<HTMLProgressElement>(root, "progress").value).toBe(40));
   Transfer.current.upload.dispatchEvent(new Event("load"));
