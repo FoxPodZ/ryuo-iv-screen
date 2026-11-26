@@ -1,4 +1,5 @@
 export interface AuthStatus {
+  demo?: true;
   required: boolean;
   authenticated: boolean;
   csrfToken: string | null;

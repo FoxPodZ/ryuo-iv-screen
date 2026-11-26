@@ -200,6 +200,8 @@ In Profiles, the four Miku Single examples reference `Ryuo_IV_MIKU_WW_01.mp4` th
 
 [Deployment, migration and rollback](docs/deployment.md) · [Web UI guide](docs/web-ui.md) · [Telemetry and selectors](docs/telemetry.md) · [HTTP API](docs/api.md) · [Remote access and security](docs/security.md)
 
+Explore the interface with fixed example data on a machine without a cooler. [Local demo](web/demo/README.md) · [Browser screenshots](docs/web-ui.md#demo-screenshots)
+
 ## Install the standalone CLI
 
 Python **3.8+** (tested on 3.11 and 3.12; the `hidapi` wheel may set a higher
@@ -592,7 +594,7 @@ the AI contribution scale. Nothing in here is claimed to work that hasn't been
 run; anything I *haven't* confirmed is explicitly marked as untested in
 [PROTOCOL.md](PROTOCOL.md).
 
-The protocol and original reference client are by **FoxPodZ (foxpodz.de)**. The Linux service design draws on shorti1996’s work on device lifecycle, media handling and screen controls. The AMD and alternative screen projects served as interoperability references. [Original protocol project](https://github.com/foxpodz/ryuo-iv-screen) · [ryuo-display](https://github.com/shorti1996/ryuo-display) · [asus-ryuo-iv-linux](https://github.com/dragocz95/asus-ryuo-iv-linux) · [rog-studio](https://github.com/zleo-ai/rog-studio)
+The protocol and original reference client are by **FoxPodZ (foxpodz.de)**. The Linux service design draws on shorti1996’s work on device lifecycle, media handling and screen controls. The AMD and alternative screen projects served as interoperability references. [Original protocol project](https://github.com/foxpodz/ryuo-iv-screen) · [ryuo-display](https://github.com/shorti1996/ryuo-display) · [asus-ryuo-iv-linux](https://github.com/dragocz95/asus-ryuo-iv-linux) · [rog-studio](https://github.com/zleo-ai/rog-studio) · [Project credits and file-level attribution](NOTICE.md)
 
 ## Disclaimer
 

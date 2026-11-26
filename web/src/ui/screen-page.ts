@@ -71,7 +71,7 @@ export class ScreenPage extends LitElement {
     fieldset { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem; margin: 0; padding: .8rem; border: 1px solid #ffffff16; border-radius: .8rem; }
     legend { padding: 0 .35rem; color: #67e5d7; }
     label { display: grid; gap: .3rem; color: #aeb9c9; font-size: .82rem; }
-    input, select { width: 100%; min-width: 0; padding: .55rem; border: 1px solid #ffffff24; border-radius: .5rem; color: #f5f7fb; background: #111827; font: inherit; }
+    input, select { box-sizing: border-box; margin: 0; width: 100%; min-width: 0; padding: .55rem; border: 1px solid #ffffff24; border-radius: .5rem; color: #f5f7fb; background: #111827; font: inherit; }
     input[type="color"] { min-height: 2.65rem; padding: .25rem; }
     input:focus-visible, select:focus-visible { outline: 2px solid #65e5d7; outline-offset: 2px; }
     .slots { display: grid; gap: .65rem; margin-top: .8rem; }

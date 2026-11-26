@@ -1,7 +1,7 @@
 import {beforeAll, describe, expect, it} from "vitest";
 
 import type {AppView} from "../src/store";
-import type {SnapshotDocument} from "../src/api-types";
+import type {AuthStatus, SnapshotDocument} from "../src/api-types";
 
 beforeAll(async () => {
   await import("../src/ui/dashboard-page");
@@ -108,4 +108,27 @@ describe("dashboard-page", () => {
     expect(element.shadowRoot?.textContent).not.toContain("Загрузка телеметрии");
     element.remove();
   });
+});
+
+it("keeps the demo label across tabs and removes live claims from example telemetry", async () => {
+  const {AppStore} = await import("../src/store");
+  await import("../src/ui/ryuo-app");
+  const auth = {demo: true, required: false, authenticated: true, csrfToken: null} satisfies AuthStatus;
+  const app = document.createElement("ryuo-app");
+  app.store = new AppStore({
+    authStatus: async () => auth, login: async () => auth, loadSnapshot: async () => dashboardSnapshot,
+  }, {connect: (_last, emit) => { emit(1, dashboardSnapshot); return {close() {}}; }});
+  document.body.append(app);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const header = app.shadowRoot!.querySelector("header")!;
+    expect(header.textContent).toContain("Демонстрационные данные");
+    expect(app.shadowRoot!.querySelector("dashboard-page")!.shadowRoot!.textContent).not.toMatch(/\bLive\b/i);
+    header.querySelectorAll("button")[1].click();
+    await app.updateComplete;
+    expect(app.shadowRoot!.querySelector("header")!.textContent).toContain("Демонстрационные данные");
+    const preview = app.shadowRoot!.querySelector("screen-page")!.shadowRoot!.querySelector("device-preview")!;
+    await preview.updateComplete;
+    expect(preview.shadowRoot!.querySelector("figcaption")!.textContent).toContain("не снимок экрана");
+  } finally { app.remove(); }
 });

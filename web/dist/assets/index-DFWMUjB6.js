@@ -47,7 +47,7 @@
       <section aria-label="Сводка системы">
         <div class="hero">
           <section class="panel device" aria-label="Устройство">
-            <span class="eyebrow">ROG Ryuo IV · Live</span>
+            <span class="eyebrow">ROG Ryuo IV · ${this.view.auth?.demo?`Demo`:`Live`}</span>
             <h1>${t.model||`Ryuo IV`}</h1>
             <div class="status"><span class="dot ${t.connected?``:`offline`}"></span>${t.connected?`Подключено`:`Нет соединения`} · ${t.health}</div>
           </section>
@@ -62,7 +62,7 @@
           </section>
         </div>
         <section aria-label="Телеметрия">
-          <h2>Live telemetry</h2>
+          <h2>${this.view.auth?.demo?`Пример телеметрии`:`Live telemetry`}</h2>
           <div class="grid">
             ${Object.entries(r.measurements).map(([e,t])=>w`
               <article class="panel metric ${t.available?``:`unavailable`}">
@@ -145,13 +145,16 @@
           </span>
         </header>
         <label>Датчик
-          <select .value=${this.assignment.enabled?this.assignment.measurement_id:``} @change=${this.onSensorChange}>
+          <select @change=${this.onSensorChange}>
             <option value="">Отключён — позиция сохранена</option>
             ${this.options.map(e=>w`
               <option value=${e.descriptor.measurementId}>
                 ${e.descriptor.label} · ${e.descriptor.ref.provider} · ${e.available?`доступен`:`недоступен`}
               </option>
             `)}
+            ${this.assignment.enabled&&!e?w`
+              <option value=${this.assignment.measurement_id} disabled>${this.assignment.measurement_id} · недоступен</option>
+            `:E}
           </select>
         </label>
         ${e?.userLabelCapable?w`
@@ -167,7 +170,7 @@
           </div>
         `:E}
       </article>
-    `}emit(e,t){this.dispatchEvent(new CustomEvent(e,{detail:t,bubbles:!0,composed:!0}))}move(e){this.emit(`slot-move`,{from:this.index,to:this.index+e})}onDragStart(e){e.dataTransfer?.setData(`text/plain`,String(this.index)),e.dataTransfer&&(e.dataTransfer.effectAllowed=`move`),this.emit(`slot-drag-start`,{index:this.index})}onDragOver(e){e.preventDefault(),e.dataTransfer&&(e.dataTransfer.dropEffect=`move`)}onDrop(e){e.preventDefault(),this.emit(`slot-drop`,{index:this.index})}onSensorChange(e){let t=e.currentTarget.value;if(!t){this.emit(`slot-change`,{index:this.index,assignment:{...this.assignment,enabled:!1}});return}let n=this.options.find(e=>e.descriptor.measurementId===t);if(!n)return;let r=n.descriptor.label.slice(0,ct);this.emit(`slot-change`,{index:this.index,assignment:{enabled:!0,measurement_id:t,widget:n.widget,label:n.userLabelCapable?r:null}})}onLabelChange(e){let t=e.currentTarget.value.trim().slice(0,ct),n=this.options.find(e=>e.descriptor.measurementId===this.assignment.measurement_id);if(!n?.userLabelCapable)return;let r=n.descriptor.label.slice(0,ct);this.emit(`slot-change`,{index:this.index,assignment:{...this.assignment,label:t||r,widget:`Fan Speed ${t||r}`}})}};V([F({attribute:!1})],W.prototype,`assignment`,void 0),V([F({attribute:!1})],W.prototype,`options`,void 0),V([F({type:Number})],W.prototype,`index`,void 0),W=V([P(`sensor-slot`)],W);var lt=()=>({schema_version:1,revision:0,active_profile:null,screen_mode:`Full Screen`,media:[[]],playback_modes:[`Single`],slots:H([]),brightness:85,temperature_unit:`Celsius`,refresh_interval:1,title_colors:[`#E5252B`],content_colors:[`#FFFFFF`],opacity:100,rgb_mode:`off`,rgb_target:`value`,thermal_source:`cpu.temperature`,sensor_selectors:{}}),G=class extends N{constructor(...e){super(...e),this.snapshot=null,this.sensors=[],this.mutationError=null,this.draft=lt(),this.fullRestart=!1,this.dragFrom=null,this.draftRevision=-1,this.patchTimer=null,this.pending=new Map}static{this.styles=o`
+    `}updated(){let e=this.renderRoot.querySelector(`select`);e.value=this.assignment.enabled?this.assignment.measurement_id:``}emit(e,t){this.dispatchEvent(new CustomEvent(e,{detail:t,bubbles:!0,composed:!0}))}move(e){this.emit(`slot-move`,{from:this.index,to:this.index+e})}onDragStart(e){e.dataTransfer?.setData(`text/plain`,String(this.index)),e.dataTransfer&&(e.dataTransfer.effectAllowed=`move`),this.emit(`slot-drag-start`,{index:this.index})}onDragOver(e){e.preventDefault(),e.dataTransfer&&(e.dataTransfer.dropEffect=`move`)}onDrop(e){e.preventDefault(),this.emit(`slot-drop`,{index:this.index})}onSensorChange(e){let t=e.currentTarget.value;if(!t){this.emit(`slot-change`,{index:this.index,assignment:{...this.assignment,enabled:!1}});return}let n=this.options.find(e=>e.descriptor.measurementId===t);if(!n)return;let r=n.descriptor.label.slice(0,ct);this.emit(`slot-change`,{index:this.index,assignment:{enabled:!0,measurement_id:t,widget:n.widget,label:n.userLabelCapable?r:null}})}onLabelChange(e){let t=e.currentTarget.value.trim().slice(0,ct),n=this.options.find(e=>e.descriptor.measurementId===this.assignment.measurement_id);if(!n?.userLabelCapable)return;let r=n.descriptor.label.slice(0,ct);this.emit(`slot-change`,{index:this.index,assignment:{...this.assignment,label:t||r,widget:`Fan Speed ${t||r}`}})}};V([F({attribute:!1})],W.prototype,`assignment`,void 0),V([F({attribute:!1})],W.prototype,`options`,void 0),V([F({type:Number})],W.prototype,`index`,void 0),W=V([P(`sensor-slot`)],W);var lt=()=>({schema_version:1,revision:0,active_profile:null,screen_mode:`Full Screen`,media:[[]],playback_modes:[`Single`],slots:H([]),brightness:85,temperature_unit:`Celsius`,refresh_interval:1,title_colors:[`#E5252B`],content_colors:[`#FFFFFF`],opacity:100,rgb_mode:`off`,rgb_target:`value`,thermal_source:`cpu.temperature`,sensor_selectors:{}}),G=class extends N{constructor(...e){super(...e),this.snapshot=null,this.sensors=[],this.mutationError=null,this.draft=lt(),this.fullRestart=!1,this.dragFrom=null,this.draftRevision=-1,this.patchTimer=null,this.pending=new Map}static{this.styles=o`
     :host { display: block; color: #f5f7fb; }
     .page { display: grid; gap: 1rem; }
     .heading { display: flex; justify-content: space-between; gap: 1rem; align-items: end; }
@@ -181,7 +184,7 @@
     fieldset { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem; margin: 0; padding: .8rem; border: 1px solid #ffffff16; border-radius: .8rem; }
     legend { padding: 0 .35rem; color: #67e5d7; }
     label { display: grid; gap: .3rem; color: #aeb9c9; font-size: .82rem; }
-    input, select { width: 100%; min-width: 0; padding: .55rem; border: 1px solid #ffffff24; border-radius: .5rem; color: #f5f7fb; background: #111827; font: inherit; }
+    input, select { box-sizing: border-box; margin: 0; width: 100%; min-width: 0; padding: .55rem; border: 1px solid #ffffff24; border-radius: .5rem; color: #f5f7fb; background: #111827; font: inherit; }
     input[type="color"] { min-height: 2.65rem; padding: .25rem; }
     input:focus-visible, select:focus-visible { outline: 2px solid #65e5d7; outline-offset: 2px; }
     .slots { display: grid; gap: .65rem; margin-top: .8rem; }
@@ -618,7 +621,7 @@
               <button type="button" aria-current=${this.page===e?`page`:`false`}
                 @click=${()=>this.navigate(e)}>${Dt[e]}</button>`)}
           </nav>`}
-        <div class="stream ${this.view.connected?`live`:``}">${this.view.connected?`Live`:`Offline`}</div>
+        <div class="stream ${this.view.connected?`live`:``}">${this.view.auth?.demo?`Демонстрационные данные`:this.view.connected?`Live`:`Offline`}</div>
       </header>
       <main>
         ${this.view.phase===`login`?w`<login-view .view=${this.view} @login-submit=${this.onLogin}></login-view>`:this.renderPage()}

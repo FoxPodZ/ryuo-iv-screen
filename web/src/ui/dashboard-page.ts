@@ -85,7 +85,7 @@ export class DashboardPage extends LitElement {
       <section aria-label="Сводка системы">
         <div class="hero">
           <section class="panel device" aria-label="Устройство">
-            <span class="eyebrow">ROG Ryuo IV · Live</span>
+            <span class="eyebrow">ROG Ryuo IV · ${this.view.auth?.demo ? "Demo" : "Live"}</span>
             <h1>${device.model || "Ryuo IV"}</h1>
             <div class="status"><span class="dot ${device.connected ? "" : "offline"}"></span>${device.connected ? "Подключено" : "Нет соединения"} · ${device.health}</div>
           </section>
@@ -100,7 +100,7 @@ export class DashboardPage extends LitElement {
           </section>
         </div>
         <section aria-label="Телеметрия">
-          <h2>Live telemetry</h2>
+          <h2>${this.view.auth?.demo ? "Пример телеметрии" : "Live telemetry"}</h2>
           <div class="grid">
             ${Object.entries(telemetry.measurements).map(([id, measurement]) => html`
               <article class="panel metric ${measurement.available ? "" : "unavailable"}">

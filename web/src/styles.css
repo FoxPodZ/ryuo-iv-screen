@@ -18,3 +18,6 @@ button, input { font: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+footer { padding: 1rem; text-align: center; font-size: .85rem; color: #aeb9c9; }
+footer a { color: #65e5d7; }

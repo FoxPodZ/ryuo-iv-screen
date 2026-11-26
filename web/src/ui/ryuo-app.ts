@@ -62,7 +62,7 @@ export class RyuoApp extends LitElement {
               <button type="button" aria-current=${this.page === page ? "page" : "false"}
                 @click=${() => this.navigate(page)}>${tabs[page]}</button>`)}
           </nav>` : ""}
-        <div class="stream ${this.view.connected ? "live" : ""}">${this.view.connected ? "Live" : "Offline"}</div>
+        <div class="stream ${this.view.connected ? "live" : ""}">${this.view.auth?.demo ? "Демонстрационные данные" : this.view.connected ? "Live" : "Offline"}</div>
       </header>
       <main>
         ${this.view.phase === "login"

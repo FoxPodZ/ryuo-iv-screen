@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "demo": "vite --mode demo --host 127.0.0.1 --port 5173 --strictPort",
     "test": "vitest",
     "build": "vite build"
   },

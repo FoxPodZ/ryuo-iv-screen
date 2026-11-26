@@ -6,6 +6,7 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "experimentalDecorators": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["vitest/globals", "node"]

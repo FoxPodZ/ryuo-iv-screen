@@ -223,3 +223,38 @@ describe("screen-page", () => {
     });
   });
 });
+
+it("keeps assigned sensor values selected when options arrive after the snapshot", async () => {
+  const page = document.createElement("screen-page");
+  page.snapshot = snapshot();
+  page.controller = new FakeController();
+  document.body.append(page);
+  await page.updateComplete;
+  page.sensors = sensors;
+  await page.updateComplete;
+  const slots = [...page.shadowRoot!.querySelectorAll("sensor-slot")];
+  await Promise.all(slots.map(slot => slot.updateComplete));
+  expect(slots.map(slot => slot.shadowRoot!.querySelector("select")!.value)).toEqual([
+    "cpu.temperature", "fan.aio.rpm", "", "", "", "",
+  ]);
+});
+
+it("shows an enabled missing sensor and lets the operator explicitly disable it", async () => {
+  const {page} = await renderPage();
+  page.sensors = sensors.filter(item => item.measurementId !== "fan.aio.rpm");
+  await page.updateComplete;
+  const slot = page.shadowRoot!.querySelectorAll("sensor-slot")[1];
+  await slot.updateComplete;
+  const select = slot.shadowRoot!.querySelector("select")!;
+  expect(select.value).toBe("fan.aio.rpm");
+  expect(select.selectedOptions[0].textContent).toMatch(/fan\.aio\.rpm.*недоступен/i);
+  const off = [...select.options].find(option => option.value === "")!;
+  expect(off.disabled).toBe(false);
+  expect(off.selected).toBe(false);
+  select.value = off.value;
+  select.dispatchEvent(new Event("change", {bubbles: true}));
+  await page.updateComplete;
+  expect(page.draft.slots[1]).toMatchObject({enabled: false, measurement_id: "fan.aio.rpm"});
+  await slot.updateComplete;
+  expect(select.selectedOptions[0].textContent).toContain("Отключён");
+});

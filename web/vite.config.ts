@@ -1,7 +1,10 @@
 import {defineConfig} from "vite";
 import {resolve} from "node:path";
 
-export default defineConfig({
+import {demoApi} from "./demo/mock-api.ts";
+
+export default defineConfig(({mode}) => ({
+  plugins: mode === "demo" ? [demoApi()] : [],
   root: resolve(import.meta.dirname, "src"),
   base: "/",
   build: {
@@ -9,4 +12,4 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
   },
-});
+}));

@@ -40,13 +40,16 @@ export class SensorSlot extends LitElement {
           </span>
         </header>
         <label>Датчик
-          <select .value=${this.assignment.enabled ? this.assignment.measurement_id : ""} @change=${this.onSensorChange}>
+          <select @change=${this.onSensorChange}>
             <option value="">Отключён — позиция сохранена</option>
             ${this.options.map((option) => html`
               <option value=${option.descriptor.measurementId}>
                 ${option.descriptor.label} · ${option.descriptor.ref.provider} · ${option.available ? "доступен" : "недоступен"}
               </option>
             `)}
+            ${this.assignment.enabled && !selected ? html`
+              <option value=${this.assignment.measurement_id} disabled>${this.assignment.measurement_id} · недоступен</option>
+            ` : nothing}
           </select>
         </label>
         ${selected?.userLabelCapable ? html`
@@ -63,6 +66,12 @@ export class SensorSlot extends LitElement {
         ` : nothing}
       </article>
     `;
+  }
+
+  protected updated(): void {
+    // Native selects resolve a value against the options currently in the DOM.
+    const select = this.renderRoot.querySelector("select")!;
+    select.value = this.assignment.enabled ? this.assignment.measurement_id : "";
   }
 
   private emit(name: string, detail: unknown): void {
