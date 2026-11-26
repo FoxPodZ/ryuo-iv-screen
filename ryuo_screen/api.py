@@ -7,6 +7,7 @@ import asyncio
 import copy
 import json
 import re
+import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -15,6 +16,7 @@ from aiohttp import web
 
 from .auth import (
     SECURITY_KEY,
+    SESSION_KEY,
     SecurityPolicy,
     auth_diagnostics,
     auth_login,
@@ -22,6 +24,7 @@ from .auth import (
     auth_status,
     security_middleware,
 )
+from .catalog import MediaCatalog
 from .device import DeviceCommand, LatestTelemetry
 from .media import MediaBusy, MediaManager, MediaOperationError, MediaTargetChanged, ToolUnavailable
 from .models import CommandResult, Measurement, SensorDescriptor, TelemetrySnapshot
@@ -71,7 +74,7 @@ class SseSubscription:
     def queue_size(self) -> int:
         return self._queue.qsize()
 
-    async def get(self) -> SseEvent:
+    async def get(self) -> Optional[SseEvent]:
         return await self._queue.get()
 
     def _offer(self, event: SseEvent) -> None:
@@ -92,12 +95,16 @@ class SseSubscription:
         if not self._closed:
             self._closed = True
             self._hub._discard(self)
+            if self._queue.full():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
 
 
 class SseHub:
     """Publish immutable snapshots to bounded newest-only queues."""
 
     def __init__(self, initial_snapshot: Optional[Mapping[str, Any]] = None) -> None:
+        self.generation = uuid.uuid4().hex
         self._last_event_id = 0
         self._latest: Optional[SseEvent] = None
         self._subscribers = set()
@@ -156,8 +163,12 @@ class AppContext:
         if self.sse_heartbeat <= 0:
             raise ValueError("SSE heartbeat must be positive")
         self.state = self.state_store.load()
+        self.stream_tasks = set()
+        self.shutting_down = False
         self.mutation_lock = asyncio.Lock()
         self._live_task = None
+        self._interval_changed = asyncio.Event()
+        self._publish_interval = self.state.refresh_interval
         if self.security is None:
             self.security = SecurityPolicy.from_config(AppConfig())
         self.web_root = Path(self.web_root) if self.web_root is not None else _DEFAULT_WEB_ROOT
@@ -176,6 +187,9 @@ class AppContext:
 
     def publish_snapshot(self) -> int:
         assert self.sse is not None
+        if self._publish_interval != self.state.refresh_interval:
+            self._publish_interval = self.state.refresh_interval
+            self._interval_changed.set()
         return self.sse.publish(self.snapshot_document())
 
     @property
@@ -204,7 +218,13 @@ class AppContext:
         while True:
             # State mutations replace the immutable ScreenState, so the next
             # iteration automatically adopts the current telemetry cadence.
-            await asyncio.sleep(float(self.state.refresh_interval))
+            try:
+                await asyncio.wait_for(self._interval_changed.wait(), max(.25, self._publish_interval))
+            except asyncio.TimeoutError:
+                pass
+            else:
+                self._interval_changed.clear()
+                continue
             try:
                 self.publish_snapshot()
             except Exception:
@@ -580,7 +600,10 @@ async def _get_media_preview(request: web.Request) -> web.Response:
 
 async def _delete_media(request: web.Request) -> web.Response:
     manager = _media_manager(request)
-    result = await manager.delete(request.match_info["name"])
+    transport = request.transport
+    result = await manager.delete(
+        request.match_info["name"], client_gone=transport.is_closing if transport else None,
+    )
     return web.json_response(result.to_dict(), status=200 if result.confirmed else 502)
 
 
@@ -686,6 +709,10 @@ async def _apply_profile(request: web.Request) -> web.Response:
             raise RevisionConflict(expected, current.revision)
         profile = context.profile_store.get(request.match_info["slug"])
         new_state = _state_from_profile(profile, current.revision + 1)
+        status = context.device.status()
+        if status.connected:
+            media = MediaCatalog.from_conn(status.descriptor).resolve_playlists(new_state.media)
+            new_state = replace(new_state, media=media)
         context.state_store.save(new_state)
         context.state = new_state
         result = _ticket_result(context.device.submit(DeviceCommand.for_state(new_state)))
@@ -703,23 +730,50 @@ async def _events(request: web.Request) -> web.StreamResponse:
         except ValueError as exc:
             raise ValueError("Last-Event-ID must be an integer") from exc
     assert context.sse is not None
+    if context.shutting_down:
+        raise web.HTTPServiceUnavailable()
+    generation = request.headers.get("X-Ryuo-Stream-Generation")
+    if last_id is not None and (
+        last_id > context.sse.last_event_id
+        or (generation is not None and generation != context.sse.generation)
+    ):
+        return web.json_response({"error": "stream_reset", "message": "event stream restarted"}, status=409)
+    session = request.get(SESSION_KEY)
     subscriber = context.sse.subscribe(last_id)
+    task = asyncio.current_task()
+    context.stream_tasks.add(task)
     response = web.StreamResponse(
         status=200,
         headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "X-Ryuo-Stream-Generation": context.sse.generation,
         },
     )
+    unsubscribe = None
+    if session is not None:
+        loop = asyncio.get_running_loop()
+        unsubscribe = context.security.sessions.watch_revocation(
+            session.token, lambda: loop.call_soon_threadsafe(subscriber.close)
+        )
     prepared = False
     try:
         await response.prepare(request)
         prepared = True
         while True:
+            timeout = context.sse_heartbeat
+            if session is not None:
+                timeout = min(timeout, context.security.sessions.remaining(session))
+                if timeout <= 0:
+                    break
             try:
-                event = await asyncio.wait_for(subscriber.get(), context.sse_heartbeat)
+                event = await asyncio.wait_for(subscriber.get(), timeout)
             except asyncio.TimeoutError:
+                event = None
+            if session is not None and not context.security.sessions.remaining(session):
+                break
+            if event is None:
                 await response.write(b": heartbeat\n\n")
                 continue
             payload = json.dumps(event.snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -732,6 +786,9 @@ async def _events(request: web.Request) -> web.StreamResponse:
             raise
     finally:
         subscriber.close()
+        context.stream_tasks.discard(task)
+        if unsubscribe is not None:
+            unsubscribe()
     return response
 
 
@@ -765,6 +822,15 @@ async def _web_asset(request: web.Request) -> web.StreamResponse:
     })
 
 
+async def _stop_streams(app: web.Application) -> None:
+    context = app[CONTEXT_KEY]
+    context.shutting_down = True
+    tasks = tuple(context.stream_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _live_events_context(app: web.Application):
     context: AppContext = app[CONTEXT_KEY]
     await context.start_live_publisher()
@@ -781,6 +847,7 @@ def create_app(context: AppContext) -> web.Application:
     app[CONTEXT_KEY] = context
     assert context.security is not None
     app[SECURITY_KEY] = context.security
+    app.on_shutdown.append(_stop_streams)
     app.cleanup_ctx.append(_live_events_context)
     app.router.add_get(API_PREFIX + "/auth/status", auth_status)
     app.router.add_get(API_PREFIX + "/diagnostics", auth_diagnostics)

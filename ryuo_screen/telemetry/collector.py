@@ -23,11 +23,24 @@ def _number(measurement: Optional[Measurement]) -> _Number:
     return 0
 
 
+def host_metrics(psutil, system):
+    vm = psutil.virtual_memory()
+    du = psutil.disk_usage("C:\\" if system == "Windows" else "/")
+    memory = {"total": vm.total // (1024 ** 2), "used": vm.used // (1024 ** 2),
+              "load": int(vm.percent), "temperature": 0, "speed": 0}
+    disk = {"total": du.total // (1024 ** 3), "used": du.used // (1024 ** 3),
+            "load": int(du.percent), "activity": 0,
+            "temperature": 0, "readSpeed": 0, "writeSpeed": 0}
+    return {"memory": memory, "disk": disk}
+
+
 class TelemetryCollector:
     def __init__(
         self, providers: Sequence[TelemetryProvider], preferred_gpu_provider: Optional[str] = None,
-        *, clock: Callable[[], float] = time.monotonic,
+        *, clock: Callable[[], float] = time.monotonic, host_sampler=None,
     ) -> None:
+        self._host_sampler = host_sampler
+        self._host = {}
         self._providers = tuple(providers)
         self._preferred_gpu_provider = preferred_gpu_provider
         self._selectors: Dict[str, SensorRef] = {}
@@ -111,6 +124,12 @@ class TelemetryCollector:
         sampled_at = time.time()
         measurements = {}
         errors = dict(self._probe_errors)
+        if self._host_sampler is not None:
+            try:
+                self._host = self._host_sampler()
+            except (OSError, RuntimeError) as exc:
+                errors["host"] = str(exc)
+                self._host = {}
         gpu_by_provider = {}
         for provider in self._providers:
             provider_id = provider.provider_id
@@ -186,11 +205,7 @@ class TelemetryCollector:
         extra_readouts: Optional[Mapping[str, _Number]] = None,
         fan_aliases: Optional[Mapping[Tuple[str, SensorRef], str]] = None,
     ) -> dict:
-        """Build the legacy payload; unavailable values become zero here.
-
-        Host memory and disk retain the protocol defaults. The direct CLI
-        supplies its existing psutil readings separately.
-        """
+        """Map the last sampled host and provider data to wire units."""
         measurements = snapshot.measurements
 
         def value(key: str) -> _Number:
@@ -240,5 +255,6 @@ class TelemetryCollector:
                 "chipsetTemperature": round(value("motherboard.temperature.chipset")),
             },
             fans=fans,
+            **self._host,
             timestamp_ms=int(snapshot.sampled_at * 1000),
         )

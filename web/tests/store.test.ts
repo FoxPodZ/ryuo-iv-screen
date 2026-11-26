@@ -263,3 +263,19 @@ describe("AppStore", () => {
     expect(store.value.mutationError).toContain("device queue is full");
   });
 });
+
+it("drops a previous daemon cursor and accepts the restarted snapshot", async () => {
+  const api = new FakeApi();
+  const events = new ManualConnector();
+  const retry: Array<() => void> = [];
+  const store = new AppStore(api, events, (fn) => { retry.push(fn); return 0; });
+  await store.start();
+  events.onEvent!(90000, snapshot(12));
+  events.onError!(new ApiError(409, "stream_reset", "Stream restarted"));
+  retry.pop()!();
+  expect(events.starts.at(-1)).toBe(null);
+  events.onEvent!(1, snapshot(1));
+  expect(store.value.snapshot?.revision).toBe(1);
+  expect(store.value.lastEventId).toBe(1);
+  store.stop();
+});

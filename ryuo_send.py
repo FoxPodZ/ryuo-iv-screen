@@ -51,7 +51,7 @@ from ryuo_screen.client import (
 from ryuo_screen.ownership import OwnershipError
 from ryuo_screen.store import ScreenState
 from ryuo_screen.telemetry.amd import AmdGpuProvider
-from ryuo_screen.telemetry.collector import TelemetryCollector
+from ryuo_screen.telemetry.collector import TelemetryCollector, host_metrics
 from ryuo_screen.telemetry.cpu import CpuProvider
 from ryuo_screen.telemetry.hwmon import HwmonProvider
 from ryuo_screen.telemetry.nvidia import NvidiaProvider
@@ -185,13 +185,8 @@ def _linux_telemetry() -> TelemetryCollector:
 
 def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
     system = platform.system()
-    vm = psutil.virtual_memory()
-    du = psutil.disk_usage("C:\\" if system == "Windows" else "/")
-    memory = {"total": vm.total // (1024 ** 2), "used": vm.used // (1024 ** 2),
-              "load": int(vm.percent), "temperature": 0, "speed": 0}
-    disk = {"total": du.total // (1024 ** 3), "used": du.used // (1024 ** 3),
-            "load": int(du.percent), "activity": 0,
-            "temperature": 0, "readSpeed": 0, "writeSpeed": 0}
+    host = host_metrics(psutil, system)
+    memory, disk = host["memory"], host["disk"]
     if system == "Linux":
         collector = _linux_telemetry()
         snapshot = collector.sample()

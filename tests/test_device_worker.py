@@ -37,7 +37,7 @@ class FakeTransport:
             self.blocked.set()
             self.release.wait(2)
         if resource == proto.RES_CONN:
-            return _reply({"model": "ROG RYUO IV", "firmware": "1.0.10", "sn": "secret"})
+            return _reply({"model": "ROG RYUO IV", "firmware": "1.0.10", "sn": "secret", "media": {"preset": [], "custom": []}})
         return None
 
     def drain(self, limit=32):
@@ -134,7 +134,7 @@ def test_thermal_rgb_builds_incremental_preset_from_owner_snapshot():
     ref = SensorRef("amd", "0000:03:00.0", "temp1_input")
     snapshot = TelemetrySnapshot({
         "gpu.temperature": Measurement(
-            ref, "gpu.temperature", 70, "C", 1.0, available=True
+            ref, "gpu.temperature", 70, "C", time.time(), available=True
         )
     }, 1.0)
     state = ScreenState(
@@ -381,7 +381,7 @@ def test_oversized_base_telemetry_keeps_last_safe_payload_without_reconnect():
         _wait(lambda: len([
             call for call in transport.calls if call[3] == proto.RES_ALL
         ]) >= 3)
-        assert worker.status().phase == "degraded"
+        _wait(lambda: worker.status().phase == "degraded")
         assert worker.status().last_error
         assert "1024-byte report" in worker.status().last_error
     finally:
@@ -623,3 +623,195 @@ def test_runtime_selectors_are_applied_by_owner_before_sampling():
         assert observed[1] == ("sample", transport.calls[0][0], None)
     finally:
         worker.stop()
+
+
+@pytest.mark.parametrize("vid,pid,interface", [(0xffff, proto.PID, 0), (proto.VID, 0xffff, 0), (proto.VID, proto.PID, 1)])
+def test_auto_open_requires_complete_screen_identity(vid, pid, interface):
+    from ryuo_screen.device import HidTransport
+
+    class Hid:
+        def enumerate(self, *args):
+            return [dict(path=b"stub", vendor_id=vid, product_id=pid, interface_number=interface)]
+
+        def device(self):
+            pytest.fail("unmatched HID opened")
+
+    with pytest.raises(OSError):
+        HidTransport(Hid()).open()
+
+
+class CatalogTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.reply = _reply({"version": {"firmware": "V1.0.10"}, "media": {"preset": [], "custom": ["mine.png"]}})
+
+    def transact(self, method, resource, payload, **args):
+        super().transact(method, resource, payload, **args)
+        if resource == proto.RES_CONN:
+            return self.reply
+        if resource == proto.RES_MEDIA_DELETE:
+            return _reply({})
+
+
+@pytest.mark.parametrize("body", [None, _reply({}), _reply({"media": {"preset": []}})])
+def test_handshake_requires_complete_catalog(body):
+    t = CatalogTransport()
+    t.reply = body
+    w = DeviceWorker(t, lambda: proto.pc_info(), settle_seconds=0)
+    with pytest.raises(OSError):
+        w._connect()
+    assert not w.status().connected
+    assert not any(call[3] == proto.RES_CONFIG for call in t.calls)
+
+
+def test_capture_firmware_and_clear_catalog_on_disconnect():
+    t = CatalogTransport()
+    w = DeviceWorker(t, lambda: proto.pc_info(), settle_seconds=0, max_rate=1000)
+    w._connect()
+    assert w.status().firmware == "V1.0.10"
+    w._mark_disconnected(OSError("lost"))
+    assert w.status().descriptor == {}
+
+
+def test_reconnect_revalidates_pending_profile_before_writing_config():
+    t = CatalogTransport()
+    s = ScreenState(active_profile="pending", media=(("missing.mp4",),))
+    w = DeviceWorker(t, lambda: proto.pc_info(), state=s, settle_seconds=0, max_rate=1000)
+    w._connect()
+    assert not any(call[3] == proto.RES_CONFIG for call in t.calls)
+    assert w.status().connected and "missing.mp4" in w.status().last_error
+
+
+@pytest.mark.parametrize("change", ["reconnect", "expiry", "invalid_refresh", "valid_refresh"])
+def test_delete_bound_to_admitted_catalog_and_deadline(change):
+    t = CatalogTransport()
+    t.block_resource = "barrier"
+    w = DeviceWorker(t, lambda: proto.pc_info(), settle_seconds=0, max_rate=1000)
+    w.start()
+    try:
+        _wait(lambda: w.status().connected)
+        w.submit(DeviceCommand(proto.POST, "barrier"))
+        assert t.blocked.wait(1)
+        generation = w.status().catalog_generation
+        deadline = time.monotonic() + (-1 if change == "expiry" else 2)
+        delete = w.submit(DeviceCommand(proto.POST, proto.RES_MEDIA_DELETE,
+            {"include": ["mine.png"]}, expect_reply=True, catalog_generation=generation, deadline=deadline))
+        if change == "reconnect":
+            w.notify_resume()
+        elif change == "invalid_refresh":
+            t.reply = None
+        elif change == "valid_refresh":
+            t.reply = _reply({"media": {"preset": [], "custom": []}})
+        t.release.set()
+        result = delete.wait(2)
+        assert result.applied == (change == "valid_refresh")
+        assert bool([c for c in t.calls if c[3] == proto.RES_MEDIA_DELETE]) == (change.endswith("refresh"))
+        if change == "valid_refresh":
+            assert w.status().descriptor["media"]["custom"] == []
+    finally:
+        t.release.set()
+        w.stop()
+
+
+def test_sampling_interval_changes_without_changing_wire_heartbeat():
+    samples = []
+    def sample():
+        samples.append(time.monotonic())
+        return proto.pc_info()
+    transport = FakeTransport()
+    worker = DeviceWorker(transport, sample, state=ScreenState(refresh_interval=20),
+                          keepalive_interval=.025, settle_seconds=0, max_rate=1000)
+    worker.start()
+    try:
+        _wait(lambda: len([c for c in transport.calls if c[3] == proto.RES_ALL]) >= 4)
+        assert len(samples) == 1
+        worker.submit(DeviceCommand.for_state(ScreenState(refresh_interval=.1)))
+        _wait(lambda: len(samples) >= 3)
+        worker.submit(DeviceCommand.for_state(ScreenState(refresh_interval=30)))
+        count = len(samples)
+        heartbeats = len(transport.calls)
+        _wait(lambda: len(transport.calls) >= heartbeats + 4)
+        assert len(samples) == count
+    finally:
+        worker.stop()
+
+
+@pytest.mark.parametrize("failure", ["%", "RPM", "W", "stale", "missing", "collection error"])
+def test_loss_of_fresh_celsius_restores_static_preset_once(failure):
+    state = ScreenState(rgb_mode="thermal")
+    ref = SensorRef("cpu", "cpu", "temperature")
+    reading = Measurement(ref, state.thermal_source, 70, "°C", time.time())
+    frames = [TelemetrySnapshot({state.thermal_source: reading}, time.time())]
+    class Collector:
+        def sample(self):
+            if not frames:
+                raise RuntimeError("sensor read failed")
+            return frames[-1]
+        def catalog(self):
+            return ()
+        def to_pc_info(self, snapshot):
+            return proto.pc_info()
+    t = FakeTransport()
+    w = DeviceWorker(t, Collector(), state=state, settle_seconds=0, max_rate=10000)
+    w._connect()
+    if failure == "collection error":
+        frames.clear()
+    elif failure == "missing":
+        frames.append(TelemetrySnapshot({}, time.time()))
+    else:
+        invalid = replace(reading, sampled_at=1) if failure == "stale" else replace(reading, unit=failure)
+        frames.append(TelemetrySnapshot({state.thermal_source: invalid}, time.time()))
+    w._last_sample_time = None
+    w._send_keepalive()
+    w._send_keepalive()
+    presets = [c[4] for c in t.calls if c[3] == proto.RES_PRESET]
+    assert len(presets) == 2 and presets[-1] == proto.preset_payload_from_state(state)
+    assert "thermal" in w.status().last_error.lower()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_config_writes_catalog_spelling_on_apply_and_reconnect(pending):
+    t = CatalogTransport()
+    desired = ScreenState(active_profile="case", media=(("MINE.PNG",),))
+    w = DeviceWorker(t, lambda: proto.pc_info(), state=desired if pending else ScreenState(),
+                     settle_seconds=0, max_rate=1000)
+    w.start()
+    try:
+        _wait(lambda: w.status().connected)
+        if not pending:
+            assert w.submit(DeviceCommand.for_state(desired)).wait(1).applied
+        configs = [c[4] for c in t.calls if c[3] == proto.RES_CONFIG]
+        assert configs[-1]["waterBlockScreen"]["id"]["media"] == ["mine.png"]
+    finally:
+        w.stop()
+
+
+def test_disconnected_delete_finishes_while_reopen_is_still_blocked():
+    t = CatalogTransport()
+    reopened, release = threading.Event(), threading.Event()
+    def gated_open():
+        if t.calls:
+            reopened.set()
+            release.wait(2)
+    t.open = gated_open
+    t.block_resource = "barrier"
+    w = DeviceWorker(t, lambda: proto.pc_info(), settle_seconds=0, max_rate=1000)
+    w.start()
+    try:
+        _wait(lambda: w.status().connected)
+        w.submit(DeviceCommand(proto.POST, "barrier"))
+        assert t.blocked.wait(1)
+        command = DeviceCommand(proto.POST, proto.RES_MEDIA_DELETE, {"include": ["mine.png"]},
+                                catalog_generation=w.status().catalog_generation, deadline=time.monotonic()+2)
+        admitted = w.submit(command)
+        w.notify_resume()
+        t.release.set()
+        assert reopened.wait(1)
+        late = w.submit(command)
+        assert admitted.done and not admitted.snapshot().applied
+        assert late.done and not late.snapshot().queued
+        assert not any(c[3] == proto.RES_MEDIA_DELETE for c in t.calls)
+    finally:
+        release.set()
+        t.release.set()
+        w.stop()

@@ -18,7 +18,7 @@ The page receives live snapshots over SSE. After a stale edit, reload the curren
 
 ## Demo screenshots
 
-These browser screenshots use fixed example data. Each header identifies the demo with **Демонстрационные данные**. The screen editor shows a configuration preview. Open an image to inspect the 1440 × 1100 desktop view. [Run the local demo or reproduce the images](../web/demo/README.md)
+These browser screenshots use fixed example data. Each header identifies the demo with **Демонстрационные данные**. The screen editor shows a configuration preview. Open an image to inspect the 1440-pixel-wide desktop view, sized for each page. [Run the local demo or reproduce the images](../web/demo/README.md)
 
 | Dashboard | Screen editor |
 | --- | --- |

@@ -64,6 +64,7 @@ class RecoveringTransport:
             raise OSError("USB removed")
         if resource == proto.RES_CONN:
             return _reply({
+                "media": {"preset": [], "custom": []},
                 "model": "ROG RYUO IV Miku WW",
                 "firmware": "1.0.10",
                 "sn": "ABC123",
@@ -247,3 +248,18 @@ def test_boottime_gap_forces_reconnect_and_fresh_handshake():
     finally:
         worker.stop()
     assert len([call for call in transport.calls if call[1] == proto.RES_CONN]) >= 2
+
+
+def test_resume_wakes_backoff_once():
+    transport = RecoveringTransport(open_failures=1)
+    worker = DeviceWorker(transport, lambda: proto.pc_info(), settle_seconds=0, reconnect_backoff=(3,))
+    worker.start()
+    try:
+        _wait(lambda: worker.status().last_error == "device missing")
+        worker.notify_resume()
+        _wait(lambda: worker.status().connected, timeout=1)
+        assert worker.submit(DeviceCommand(proto.POST, "barrier")).wait(1).applied
+        assert transport.opens == 2
+        assert [call[1] for call in transport.calls].count(proto.RES_CONN) == 1
+    finally:
+        worker.stop()

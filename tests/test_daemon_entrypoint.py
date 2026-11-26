@@ -68,9 +68,14 @@ async def test_service_loads_state_serves_both_sites_and_stops_on_sigterm(tmp_pa
                 assert state["revision"] == 4 and state["state"]["brightness"] == 61
             async with uds.get("http://localhost/api/v1/device") as response:
                 assert (await response.json())["phase"] != "stopped"
-        process.terminate()
-        assert await asyncio.wait_for(process.wait(), timeout=5) == 0
-        assert not socket_path.exists()
+        async with aiohttp.ClientSession() as tcp:
+            async with tcp.get("http://127.0.0.1:{}/api/v1/events".format(port)) as stream:
+                assert (await stream.content.readline()).startswith(b"id:")
+                process.terminate()
+                assert await asyncio.wait_for(process.wait(), timeout=2) == 0
+        from ryuo_screen.ownership import DeviceOwnership
+        with DeviceOwnership(claim_name):
+            assert not socket_path.exists()
     finally:
         if process.returncode is None:
             process.kill()

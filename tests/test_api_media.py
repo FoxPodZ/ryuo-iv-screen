@@ -122,7 +122,8 @@ async def test_media_list_upload_truthfulness_and_refresh(tmp_path):
     assert body["applied"] is True and body["confirmed"] is True
     assert job_response.status == 200 and job_body == body
     assert body["name"] in refreshed["custom"] == device.custom
-    assert "bad" not in body["name"]
+    import re
+    assert re.fullmatch(r"user-[0-9a-f]{32}\.png", body["name"])
 
 
 @pytest.mark.asyncio
@@ -292,6 +293,7 @@ async def test_status_target_is_required_and_cannot_retarget_a_later_upload(tmp_
         # server happens to reuse the same transport ID for the same device.
         serial.write_text("")
         assert not (await status())["available"]
+        assert (await upload(None)).status == 409
         serial.write_text("SECOND")
         assert (await upload(second_token)).status == 409
         fresh = await status()
@@ -302,5 +304,92 @@ async def test_status_target_is_required_and_cannot_retarget_a_later_upload(tmp_
         assert "targetToken" not in await status()
         assert (await upload(None)).status == 201
         assert pushes[-1][1:3] == ["-s", "SECOND"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnected_delete_rejects_stale_listing(tmp_path):
+    client, _, device = await _client(tmp_path)
+    async with client:
+        device.status = lambda: DeviceStatus(connected=False, descriptor={"media": {"custom": ["old.png"], "preset": []}})
+        resp = await client.delete("/api/v1/media/old.png")
+        assert resp.status == 409
+        assert not device.commands
+
+
+@pytest.mark.asyncio
+async def test_preview_checks_final_size_before_returning_bytes(tmp_path, monkeypatch):
+    from ryuo_screen import media
+    monkeypatch.setattr(media, "MAX_THUMBNAIL_BYTES", 5)
+    client, _, _ = await _client(tmp_path)
+    async with client:
+        resp = await client.get("/api/v1/media/preview/thumbnail/RyUO_MIKU.mp4")
+        assert resp.status == 502
+
+
+@pytest.mark.asyncio
+async def test_detached_status_failure_is_logged(tmp_path, caplog):
+    import threading
+    started, release = threading.Event(), threading.Event()
+    client, context, _ = await _client(tmp_path)
+    def probe():
+        started.set()
+        release.wait(1)
+        raise RuntimeError("probe failure")
+    context.media.adb.available = probe
+    async with client:
+        pending = asyncio.create_task(context.media.adb_status())
+        while not started.is_set():
+            await asyncio.sleep(.005)
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        release.set()
+        for _ in range(50):
+            if "ADB status probe failed" in caplog.text:
+                break
+            await asyncio.sleep(.005)
+        assert "ADB status probe failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_preview_work_leaves_single_default_executor_slot_free(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    started, release = threading.Event(), threading.Event()
+    client, ctx, _ = await _client(tmp_path)
+    thumbnail = ctx.media.tools.thumbnail
+
+    def delayed_thumbnail(*args):
+        started.set()
+        release.wait(1)
+        return thumbnail(*args)
+
+    ctx.media.tools.thumbnail = delayed_thumbnail
+    async with client:
+        preview = asyncio.create_task(ctx.media.preview("RyUO_MIKU.mp4", "thumbnail"))
+        try:
+            while not started.is_set():
+                await asyncio.sleep(.005)
+            assert await asyncio.wait_for(loop.run_in_executor(None, lambda: True), .25)
+        finally:
+            release.set()
+            await preview
+
+
+@pytest.mark.asyncio
+async def test_abandoned_delete_marks_pending_ticket_cancelled(tmp_path):
+    from ryuo_screen.device import CommandTicket
+    from ryuo_screen.media import MediaOperationError
+    client, ctx, device = await _client(tmp_path)
+    device.custom.append("old.png")
+    ticket = CommandTicket()
+    device.submit = lambda command: ticket
+    try:
+        with pytest.raises(MediaOperationError, match="client disconnected"):
+            await asyncio.wait_for(ctx.media.delete("old.png", client_gone=lambda: True), .3)
+        assert ticket.cancelled.is_set()
     finally:
         await client.close()

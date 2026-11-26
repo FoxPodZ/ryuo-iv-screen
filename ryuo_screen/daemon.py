@@ -23,7 +23,7 @@ from .device import DeviceWorker, HidTransport
 from .media import AdbBackend, MediaCatalog, MediaManager, MediaTools
 from .store import AppConfig, ProfileStore, StateStore
 from .telemetry.amd import AmdGpuProvider
-from .telemetry.collector import TelemetryCollector
+from .telemetry.collector import TelemetryCollector, host_metrics
 from .telemetry.cpu import CpuProvider
 from .telemetry.hwmon import HwmonProvider
 from .telemetry.nvidia import NvidiaProvider
@@ -171,21 +171,32 @@ async def run_sites(
     )
 
 
-async def serve(config: AppConfig, socket_path: Path, web_root: Optional[Path]) -> None:
-    policy = SecurityPolicy.from_config(config)
-    policy.validate_bind(config.listen_host)
+def current_catalog(worker):
+    status = worker.status()
+    return MediaCatalog.from_conn(status.descriptor) if status.connected else MediaCatalog()
+
+
+def build_collector(config: AppConfig) -> TelemetryCollector:
+    import psutil
+
     sysfs = Sysfs()
     preferred = config.gpu_provider if config.gpu_provider != "auto" else None
-    collector = TelemetryCollector((
+    return TelemetryCollector((
         CpuProvider(sysfs), HwmonProvider(sysfs, config.motherboard_sensor),
         AmdGpuProvider(sysfs, config.gpu_selector if preferred != "nvidia" else None),
         NvidiaProvider(config.gpu_selector if preferred != "amd" else None),
-    ), preferred)
+    ), preferred, host_sampler=lambda: host_metrics(psutil, "Linux"))
+
+
+async def serve(config: AppConfig, socket_path: Path, web_root: Optional[Path]) -> None:
+    policy = SecurityPolicy.from_config(config)
+    policy.validate_bind(config.listen_host)
+    collector = build_collector(config)
     state_store = StateStore(config.state_path)
     worker = DeviceWorker(HidTransport(), collector, state_store.load())
     media = MediaManager(
         Path("/var/cache/ryuo-screen"), MediaTools(), AdbBackend(serial=os.getenv("ANDROID_SERIAL")),
-        worker, lambda: MediaCatalog.from_conn(worker.status().descriptor),
+        worker, lambda: current_catalog(worker),
     )
     app = create_app(AppContext(
         state_store, ProfileStore(config.profiles_dir), worker, collector,

@@ -660,3 +660,55 @@ async def test_resume_requires_session_and_csrf_before_notifying_worker(tmp_path
         assert context.state.revision == 1
     finally:
         await client.close()
+
+
+def test_direct_trusted_peer_has_no_forwarded_authority():
+    from aiohttp.test_utils import make_mocked_request
+    from ryuo_screen.auth import _forwarded_context
+    req = make_mocked_request("GET", "/", headers={"Host": "localhost"}).clone(remote="127.0.0.1")
+    policy = _lan_policy(trusted_proxy="127.0.0.1/32")
+    host, scheme, forwarded, client = _forwarded_context(req, policy)
+    assert (host, scheme, forwarded, client) == ("localhost", "http", False, "127.0.0.1")
+    assert not policy.allows_host("unconfigured.example", forwarded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["logout", "rotation", "eviction", "expiry"])
+async def test_authorized_stream_ends_when_session_ends(tmp_path, invalidate):
+    now = [0.]
+    policy = _lan_policy(clock=lambda: now[0])
+    session = policy.sessions.create()
+    client, context, _ = await _client(tmp_path, policy)
+    try:
+        response = await client.get("/api/v1/events", headers={
+            "X-Forwarded-For": "192.0.2.1", "Cookie": policy.cookie_name + "=" + session.token
+        })
+        assert response.status == 200
+        await response.content.readuntil(b"\n\n")
+        if invalidate == "logout":
+            policy.sessions.logout(session.token)
+        elif invalidate == "rotation":
+            policy.sessions.rotate(session.token)
+        elif invalidate == "eviction":
+            for _ in range(policy.sessions.max_sessions):
+                policy.sessions.create()
+        else:
+            now[0] = session.expires_at
+        context.publish_snapshot()
+        assert await asyncio.wait_for(response.content.readline(), .5) == b""
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_stream_wakes_immediately_on_logout(tmp_path):
+    policy = _lan_policy()
+    session = policy.sessions.create()
+    client, ctx, _ = await _client(tmp_path, policy)
+    async with client:
+        response = await client.get("/api/v1/events", headers={
+            "X-Forwarded-For": "192.0.2.4", "Cookie": policy.cookie_name + "=" + session.token})
+        await response.content.readuntil(b"\n\n")
+        policy.sessions.logout(session.token)
+        assert await asyncio.wait_for(response.content.read(), .4) == b""
+        assert ctx.sse.subscriber_count == 0

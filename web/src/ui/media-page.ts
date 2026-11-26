@@ -47,7 +47,8 @@ export class MediaPage extends LitElement {
 
   private edit(zone: number, changes: {items?: string[]; mode?: string}): void {
     if (!this.draft) return;
-    const {items, mode} = changes;
+    const {items} = changes;
+    const mode = items?.length === 0 ? "Single" : changes.mode;
     this.draft = {
       media: this.draft.media.map((old, index) => index === zone && items ? items : old),
       playback_modes: this.draft.playback_modes.map((old, index) => index === zone && mode ? mode : old),
@@ -122,6 +123,7 @@ export class MediaPage extends LitElement {
         ${this.view?.mediaError ? html`<p class="error" role="alert">${this.view.mediaError}</p>` : nothing}
         ${this.error ? html`<p class="error" role="alert">${this.error}</p>` : nothing}
         ${this.feedback ? html`<p class="active" role="status">${this.feedback}</p>` : nothing}
+        ${library?.adb.available && library.adb.serial ? html`<p>Устройство ADB · <code>${library.adb.serial}</code></p>` : nothing}
         ${library && !library.adb.available ? html`<p class="notice" role="status">ADB недоступен · загрузка и предпросмотр отключены. ${library.adb.reason}</p>` : nothing}
         ${library && !library.tools.ffmpeg ? html`<p class="notice" role="status">FFmpeg недоступен · предпросмотр и конвертация отключены.</p>` : nothing}
         ${library && !library.tools.ffprobe ? html`<p class="notice" role="status">FFprobe недоступен · загрузка отключена.</p>` : nothing}
@@ -199,7 +201,7 @@ export class MediaPage extends LitElement {
       <fieldset data-zone=${zone + 1} class="panel stack" ?disabled=${this.busy}>
         <legend>Зона ${zone + 1}</legend>
         <label>Повтор
-          <select name=${`playback-mode-${zone + 1}`}
+          <select ?disabled=${!items.length} name=${`playback-mode-${zone + 1}`}
             @change=${(event: Event) => this.edit(zone, {mode: (event.currentTarget as HTMLSelectElement).value})}>
             ${playbackModes.map((mode) => html`<option value=${mode} .selected=${live(this.draft!.playback_modes[zone] === mode)}>${mode}</option>`)}
           </select>

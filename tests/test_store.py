@@ -236,3 +236,16 @@ def test_screen_state_rejects_invalid_brightness(brightness):
 def test_screen_state_requires_exactly_six_slots():
     with pytest.raises(ValueError, match="six"):
         ScreenState(slots=slots()[:5])
+
+
+@pytest.mark.parametrize("mode", ["Cycle", "Random"])
+def test_empty_zone_requires_single_and_legacy_state_retains_other_fields(tmp_path, mode):
+    from ryuo_screen.store import Profile
+    with pytest.raises(ValueError, match="empty"):
+        ScreenState(media=((),), playback_modes=(mode,))
+    with pytest.raises(ValueError, match="empty"):
+        Profile(slug="legacy", name="Legacy", media=((),), playback_modes=(mode,))
+    store = StateStore(tmp_path / "state.json")
+    store.path.write_text(json.dumps(dict(ScreenState(brightness=22).to_dict(), playback_modes=[mode])))
+    loaded = store.load()
+    assert (loaded.playback_modes, loaded.brightness) == (("Single",), 22)

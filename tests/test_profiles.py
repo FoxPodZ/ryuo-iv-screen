@@ -204,3 +204,13 @@ def test_profile_files_use_group_readable_state_mode(tmp_path):
     store.create(profile())
 
     assert (store.directory / "gaming.json").stat().st_mode & 0o777 == 0o640
+
+
+def test_profile_listing_migrates_old_empty_playlist_and_skips_invalid_json_root(tmp_path):
+    store = ProfileStore(tmp_path)
+    (tmp_path / "invalid.json").write_text("[]")
+    (tmp_path / "old.json").write_text(json.dumps({
+        "slug": "old", "name": "Old", "brightness": 19, "media": [[]], "playback_modes": ["Random"]
+    }))
+    custom = [p for p in store.list() if not p.factory]
+    assert [(p.slug, p.brightness, p.playback_modes) for p in custom] == [("old", 19, ("Single",))]

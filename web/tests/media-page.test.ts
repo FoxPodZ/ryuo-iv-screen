@@ -70,3 +70,20 @@ it("opens each new page from the app shell with one main landmark", async () => 
     expect(root.querySelectorAll("main")).toHaveLength(1);
   }
 });
+
+it("identifies the selected transfer device", async () => {
+  const {store} = await setup();
+  const root = await render(new MediaPage(), store);
+  await vi.waitFor(() => expect(root.textContent).toContain("adb-sensitive-serial"));
+});
+
+it("selects Single when the last media item is removed", async () => {
+  const {store} = await setup();
+  const root = await render(new MediaPage(), store);
+  change(root, '[name="playback-mode-1"]', "Random");
+  for (let index = 0; index < 2; index++) {
+    click(root, '[data-zone="1"] button[aria-label^="Убрать"]');
+    await vi.waitFor(() => expect(root.querySelectorAll('[data-zone="1"] ol li')).toHaveLength(1-index));
+  }
+  expect(get<HTMLSelectElement>(root, '[name="playback-mode-1"]').value).toBe("Single");
+});

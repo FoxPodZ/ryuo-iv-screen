@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
+import os
+import selectors
 import re
 import shutil
 import subprocess
@@ -19,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,6 +30,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import ryuo_proto as proto
 
+from .catalog import MediaCatalog
 from .device import DeviceCommand
 from .models import CommandResult
 
@@ -39,6 +43,7 @@ MAX_PROXY = (1280, 720)
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_PROXY_BYTES = 64 * 1024 * 1024
 MAX_PROXY_SECONDS = 30
+MAX_PROBE_BYTES = 16 * 1024
 
 
 class ToolUnavailable(RuntimeError):
@@ -55,46 +60,6 @@ class MediaTargetChanged(RuntimeError):
 
 class MediaOperationError(RuntimeError):
     """A bounded external media operation failed."""
-
-
-@dataclass(frozen=True)
-class MediaCatalog:
-    factory: Tuple[str, ...] = ()
-    custom: Tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "factory", self._names("factory", self.factory))
-        object.__setattr__(self, "custom", self._names("custom", self.custom))
-
-    @staticmethod
-    def _names(label: str, values: Sequence[str]) -> Tuple[str, ...]:
-        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-            raise TypeError("{} media list must be a sequence".format(label))
-        result = []
-        for value in values:
-            if not isinstance(value, str):
-                raise TypeError("{} media names must be strings".format(label))
-            result.append(value)
-        return tuple(result)
-
-    @classmethod
-    def from_conn(cls, descriptor: Mapping[str, Any]) -> "MediaCatalog":
-        if not isinstance(descriptor, Mapping):
-            raise TypeError("conn descriptor must be an object")
-        media = descriptor.get("media") or {}
-        if not isinstance(media, Mapping):
-            raise TypeError("conn media listing must be an object")
-        return cls(media.get("preset") or (), media.get("custom") or ())
-
-    def classify(self, name: str) -> Optional[str]:
-        if name in self.factory:
-            return "factory"
-        if name in self.custom:
-            return "custom"
-        return None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"factory": list(self.factory), "custom": list(self.custom)}
 
 
 @dataclass(frozen=True)
@@ -150,11 +115,59 @@ class MediaTools:
             raise ToolUnavailable("{} is not installed".format(name))
         return value
 
-    def _run(self, argv: Sequence[str], *, capture: bool = False) -> Any:
-        kwargs: Dict[str, Any] = {"timeout": self._timeout}
-        if capture:
-            kwargs.update({"capture_output": True, "text": True})
-        result = self._runner(list(argv), **kwargs)
+    @staticmethod
+    def _input(path: Path) -> list:
+        path = Path(path).absolute()
+        with path.open("rb") as stream:
+            header = stream.read(12)
+        options = ["-protocol_whitelist", "file"]
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            demuxer = "png_pipe"
+        elif header.startswith(b"\xff\xd8\xff"):
+            demuxer = "jpeg_pipe"
+        elif header.startswith((b"GIF87a", b"GIF89a")):
+            demuxer = "gif"
+        elif header[4:8] in (b"ftyp", b"moov", b"mdat", b"free", b"wide"):
+            demuxer = "mov"
+            options.extend(["-enable_drefs", "0", "-use_absolute_path", "0"])
+        else:
+            raise ValueError("unsupported media format; use MP4, GIF, PNG, or JPG")
+        return options + ["-f", demuxer, "-i", str(path)]
+
+    def _probe_output(self, argv: Sequence[str]) -> bytes:
+        if self._runner is not subprocess.run:
+            result = self._runner(list(argv), capture_output=True, timeout=self._timeout)
+            if result.returncode:
+                raise ValueError("ffprobe rejected the input")
+            data = result.stdout
+            if len(data) > MAX_PROBE_BYTES:
+                raise ValueError("ffprobe metadata exceeds size limit")
+            return data
+
+        deadline = time.monotonic() + self._timeout
+        data = bytearray()
+        with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while True:
+                        if not selector.select(max(0, deadline - time.monotonic())):
+                            raise subprocess.TimeoutExpired(argv, self._timeout)
+                        chunk = os.read(process.stdout.fileno(), MAX_PROBE_BYTES + 1 - len(data))
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                        if len(data) > MAX_PROBE_BYTES:
+                            raise ValueError("ffprobe metadata exceeds size limit")
+                if process.wait(timeout=max(0, deadline - time.monotonic())):
+                    raise ValueError("ffprobe rejected the input")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+        return bytes(data)
+
+    def _run(self, argv: Sequence[str]) -> Any:
+        result = self._runner(list(argv), timeout=self._timeout)
         if getattr(result, "returncode", 0) != 0:
             raise RuntimeError(
                 "media tool failed: {}".format(getattr(result, "stderr", "unknown error"))
@@ -163,12 +176,13 @@ class MediaTools:
 
     def probe(self, path: Path) -> MediaInfo:
         tool = self._tool(self._ffprobe_name)
-        result = self._run([
-            tool, "-v", "error", "-show_streams", "-show_format",
-            "-of", "json", str(Path(path)),
-        ], capture=True)
+        output = self._probe_output([
+            tool, "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt,width,height:format=format_name,duration,size",
+            "-of", "json", *self._input(path),
+        ])
         try:
-            document = json.loads(result.stdout)
+            document = json.loads(output)
             streams = document.get("streams") or []
             video = next(item for item in streams if item.get("codec_type") == "video")
             fmt = document.get("format") or {}
@@ -229,7 +243,7 @@ class MediaTools:
             if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
                 raise ValueError("conversion byte limit must be a positive integer")
         scale = "scale=2240:1080:force_original_aspect_ratio=increase:flags=lanczos,setsar=1,crop=2240:1080"
-        argv = [tool, "-nostdin", "-y", "-i", str(source), "-vf", scale]
+        argv = [tool, "-nostdin", "-y", *self._input(source), "-vf", scale]
         if plan.action == "convert-still":
             argv.extend(["-frames:v", "1", "-an"])
         else:
@@ -249,7 +263,7 @@ class MediaTools:
         self._bounded(width, height, MAX_THUMBNAIL, "thumbnail")
         tool = self._tool(self._ffmpeg_name)
         self._run([
-            tool, "-nostdin", "-y", "-i", str(Path(source)), "-frames:v", "1",
+            tool, "-nostdin", "-y", *self._input(source), "-frames:v", "1",
             "-vf", "scale={}:{}".format(width, height),
             "-fs", str(MAX_THUMBNAIL_BYTES), str(Path(destination)),
         ])
@@ -259,7 +273,7 @@ class MediaTools:
         self._bounded(width, height, MAX_PROXY, "proxy")
         tool = self._tool(self._ffmpeg_name)
         self._run([
-            tool, "-nostdin", "-y", "-i", str(Path(source)),
+            tool, "-nostdin", "-y", *self._input(source),
             "-vf", "scale={}:{}".format(width, height), "-c:v", "libx264",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
             "-t", str(MAX_PROXY_SECONDS), "-fs", str(MAX_PROXY_BYTES),
@@ -332,6 +346,10 @@ class AdbBackend:
         self._target_lock = threading.RLock()
         self._last_target: Optional[AdbAvailability] = None
         self._target_token: Optional[str] = None
+
+    @property
+    def requires_target_token(self) -> bool:
+        return self.serial is None
 
     def _tool(self) -> Optional[str]:
         return self._which(self._adb_name)
@@ -484,32 +502,26 @@ class MediaPreview:
     content_type: str
 
 
-async def _call_sync(
-    function: Callable[..., Any], *args: Any, executor: Optional[Executor] = None, **kwargs: Any,
-) -> Any:
+async def _call_media(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    # At most one blocking operation per admitted job plus the shared status probe.
+    # Keep authentication's default executor available for other HTTP requests.
     loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(executor, lambda: function(*args, **kwargs))
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        # The executor call cannot be killed safely.  Delay cancellation until
-        # it has stopped touching per-job files, then let the caller's finally
-        # remove the directory without racing ffmpeg/adb.
-        while not future.done():
-            try:
-                await asyncio.shield(future)
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                break
-        raise
-
-
-async def _call_adb(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    # Each admitted job can issue one ADB call at a time, plus one shared
-    # status probe. Retire each worker as soon as its one command finishes.
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ryuo-adb") as worker:
-        return await _call_sync(function, *args, executor=worker, **kwargs)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ryuo-media") as executor:
+        future = loop.run_in_executor(executor, lambda: function(*args, **kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # The executor call cannot be killed safely.  Delay cancellation until
+            # it has stopped touching per-job files, then let the caller's finally
+            # remove the directory without racing ffmpeg/adb.
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            raise
 
 
 class MediaJob:
@@ -536,7 +548,7 @@ class MediaJob:
         # original_name is deliberately never used in a path or command.
         del original_name
         if target is None:
-            target = await _call_adb(self.adb.available)
+            target = await _call_media(self.adb.available)
         if not target.available:
             return MediaJobResult(self.job_id, None, False, False, target.reason)
         self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -559,17 +571,17 @@ class MediaJob:
                     handle.write(chunk)
             if total == 0:
                 raise ValueError("upload is empty")
-            info = await _call_sync(self.tools.probe, source)
+            info = await _call_media(self.tools.probe, source)
             plan = self.tools.plan(info)
             name = "user-{}{}".format(uuid.uuid4().hex, plan.suffix)
             output = directory / ("converted" + plan.suffix)
             if plan.action == "passthrough":
-                await _call_sync(shutil.copy2, str(source), str(output))
+                await _call_media(shutil.copy2, str(source), str(output))
             else:
-                await _call_sync(self.tools.convert, source, output, plan, self.max_bytes)
+                await _call_media(self.tools.convert, source, output, plan, self.max_bytes)
             if output.stat().st_size > self.max_bytes:
                 raise ValueError("converted media exceeds size limit")
-            pushed = await _call_adb(self.adb.push, output, name, target=target)
+            pushed = await _call_media(self.adb.push, output, name, target=target)
             if not pushed:
                 return MediaJobResult(self.job_id, name, False, False, "ADB push failed")
             refreshed = self.refresh_catalog()
@@ -624,10 +636,20 @@ class MediaManager:
             raise TypeError("catalog loader must return MediaCatalog")
         return value
 
+    @staticmethod
+    def _observe_status(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logging.getLogger(__name__).warning("ADB status probe failed: %s", type(error).__name__)
+
     async def adb_status(self) -> Tuple[AdbAvailability, Optional[str]]:
         if self._status_probe is None or self._status_probe.done():
-            self._status_probe = asyncio.create_task(_call_adb(self.adb.available))
-        target = await asyncio.shield(self._status_probe)
+            self._status_probe = asyncio.create_task(_call_media(self.adb.available))
+            self._status_probe.add_done_callback(self._observe_status)
+        task = self._status_probe
+        await asyncio.wait((task,))
+        target = task.result()
         return target, target.target_token
 
     @asynccontextmanager
@@ -653,8 +675,9 @@ class MediaManager:
         self, stream: Any, original_name: str, target_token: Optional[str] = None,
     ) -> MediaJobResult:
         async with self._admit():
-            target = await _call_adb(self.adb.available)
-            if target_token != target.target_token:
+            target = await _call_media(self.adb.available)
+            if (target_token != target.target_token
+                    or (getattr(self.adb, "requires_target_token", False) and not target_token)):
                 raise MediaTargetChanged("refresh media status and confirm the current ADB target")
             job = MediaJob(
                 self.temp_root, self.tools, self.adb, self._refresh_conn_catalog,
@@ -678,25 +701,42 @@ class MediaManager:
             source = directory / "source.media"
             destination = directory / ("thumbnail.jpg" if kind == "thumbnail" else "proxy.mp4")
             try:
-                pulled = await _call_adb(
+                pulled = await _call_media(
                     self.adb.pull, name, source,
                     factory=classification == "factory", max_bytes=self.max_bytes,
                 )
                 if not pulled:
                     raise MediaOperationError("ADB media pull failed")
                 if kind == "thumbnail":
-                    await _call_sync(self.tools.thumbnail, source, destination)
+                    await _call_media(self.tools.thumbnail, source, destination)
                     content_type = "image/jpeg"
                 else:
-                    await _call_sync(self.tools.proxy, source, destination)
+                    await _call_media(self.tools.proxy, source, destination)
                     content_type = "video/mp4"
-                return MediaPreview(destination.read_bytes(), content_type)
+                limit = MAX_THUMBNAIL_BYTES if kind == "thumbnail" else MAX_PROXY_BYTES
+                data = await _call_media(self._read_preview, destination, limit)
+                return MediaPreview(data, content_type)
             finally:
                 shutil.rmtree(str(directory), ignore_errors=True)
 
-    async def delete(self, name: str) -> MediaJobResult:
+    @staticmethod
+    def _read_preview(path: Path, limit: int) -> bytes:
+        with path.open("rb") as source:
+            if os.fstat(source.fileno()).st_size > limit:
+                raise MediaOperationError("preview exceeds size limit")
+            data = source.read(limit + 1)
+        if len(data) > limit:
+            raise MediaOperationError("preview exceeds size limit")
+        return data
+
+    async def delete(
+        self, name: str, *, client_gone: Optional[Callable[[], bool]] = None,
+    ) -> MediaJobResult:
         proto.check_media_name(name)
-        before = self.catalog()
+        status = self.device.status()
+        if not status.connected:
+            raise MediaTargetChanged("screen is disconnected")
+        before = MediaCatalog.from_conn(status.descriptor)
         if name in before.factory:
             raise PermissionError("factory media cannot be deleted")
         if name not in before.custom:
@@ -706,19 +746,24 @@ class MediaManager:
                 proto.POST, proto.RES_MEDIA_DELETE,
                 proto.media_delete_payload(include=[name]), priority=20,
                 coalesce_key="media-delete:{}".format(name),
-                expect_reply=True,
+                expect_reply=True, catalog_generation=status.catalog_generation,
+                deadline=time.monotonic() + self.refresh_timeout,
             )
             ticket = self.device.submit(command)
-            if hasattr(ticket, "wait"):
-                result = await _call_sync(ticket.wait, 10.0)
-            elif hasattr(ticket, "snapshot"):
+            try:
+                while not getattr(ticket, "done", True):
+                    if client_gone is not None and client_gone():
+                        raise MediaOperationError("delete client disconnected")
+                    if time.monotonic() >= command.deadline:
+                        raise MediaOperationError("delete confirmation timed out")
+                    await asyncio.sleep(0.025)
                 result = ticket.snapshot()
-            else:
-                raise TypeError("device submit must return a command ticket")
+            finally:
+                if not getattr(ticket, "done", True):
+                    ticket.cancelled.set()
             if not isinstance(result, CommandResult):
                 raise TypeError("device command returned an invalid result")
-            refreshed = await self._refresh_conn_catalog()
-            confirmed = bool(result.applied and result.acked and name not in refreshed.custom)
+            confirmed = bool(result.applied and result.acked)
             job_result = MediaJobResult(
                 uuid.uuid4().hex, name, confirmed, confirmed,
                 None if confirmed else result.error or "delete was not confirmed by refreshed conn listing",
@@ -741,10 +786,10 @@ class MediaManager:
         while True:
             status = self.device.status()
             recovery = getattr(status, "recovery_count", None)
-            if before is None or (recovery is not None and recovery > before):
+            if status.connected and recovery is not None and recovery > before:
                 return self.catalog()
             if asyncio.get_running_loop().time() >= deadline:
-                return self.catalog()
+                raise MediaOperationError("device catalog refresh timed out")
             await asyncio.sleep(0.05)
 
 

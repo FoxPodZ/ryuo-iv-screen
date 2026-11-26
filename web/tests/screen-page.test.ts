@@ -258,3 +258,17 @@ it("shows an enabled missing sensor and lets the operator explicitly disable it"
   await slot.updateComplete;
   expect(select.selectedOptions[0].textContent).toContain("Отключён");
 });
+
+it("maps ARGB to the color picker and retains its alpha", async () => {
+  const {page, controller} = await renderPage();
+  const next = snapshot();
+  next.state.revision = ++next.revision;
+  next.state.title_colors = ["#4080A0C0"];
+  page.snapshot = next;
+  await page.updateComplete;
+  const picker = page.shadowRoot!.querySelector<HTMLInputElement>('[name="title_color_0"]')!;
+  expect(picker.value.toLowerCase()).toBe("#80a0c0");
+  picker.value = "#ffeedd";
+  picker.dispatchEvent(new Event("input"));
+  await vi.waitFor(() => expect(controller.calls.at(-1)?.changes.title_colors).toEqual(["#40FFEEDD"]));
+});

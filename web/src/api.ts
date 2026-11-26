@@ -114,7 +114,7 @@ export class ApiClient {
 
   async loadMedia(): Promise<MediaCatalog> {
     const {factory, custom, tools, adb} = await this.request<MediaCatalog>("/media");
-    return {factory, custom, tools, adb: {available: adb.available, reason: adb.reason, targetToken: adb.targetToken}};
+    return {factory, custom, tools, adb: {available: adb.available, reason: adb.reason, serial: adb.serial, targetToken: adb.targetToken}};
   }
 
   async deleteMedia(name: string): Promise<MediaResult> {
@@ -239,6 +239,8 @@ function parseEventBlock(block: string): {id: number; snapshot: SnapshotDocument
 }
 
 export class EventStream implements EventConnector {
+  private generation: string | null = null;
+
   connect(
     lastEventId: number | null,
     onEvent: (id: number, value: SnapshotDocument) => void,
@@ -258,6 +260,7 @@ export class EventStream implements EventConnector {
   ): Promise<void> {
     const headers = new Headers({Accept: "text/event-stream"});
     if (lastEventId !== null) headers.set("Last-Event-ID", String(lastEventId));
+    if (lastEventId !== null && this.generation) headers.set("X-Ryuo-Stream-Generation", this.generation);
     const response = await fetch(`${API}/events`, {
       credentials: "same-origin",
       headers,
@@ -268,6 +271,7 @@ export class EventStream implements EventConnector {
       await readJson<never>(response);
       return;
     }
+    this.generation = response.headers.get("X-Ryuo-Stream-Generation");
     if (!response.body) throw new Error("Сервер не открыл поток событий");
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

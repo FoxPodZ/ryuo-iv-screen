@@ -429,6 +429,9 @@ export class AppStore {
       this.handleLoadError(error);
       return;
     }
+    if (error instanceof ApiError && error.code === "stream_reset") {
+      this.update({lastEventId: 0, snapshot: null});
+    }
     const delay = this.state.retryDelay;
     this.update({connected: false, error: errorMessage(error), retryDelay: Math.min(delay * 2, 10_000)});
     const token = ++this.retryToken;

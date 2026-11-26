@@ -60,7 +60,7 @@ def _string(name: str, value: Any, allow_empty: bool = False) -> str:
 def _color(name: str, value: Any) -> str:
     value = _string(name, value)
     if not _COLOR.fullmatch(value):
-        raise ValueError("{} must be #RRGGBB or #RRGGBBAA".format(name))
+        raise ValueError("{} must be #RRGGBB or #AARRGGBB".format(name))
     return value.upper()
 
 
@@ -310,6 +310,8 @@ def _validate_screen(value: Any) -> None:
         raise ValueError("screen mode and media zone count disagree")
     if len(value.playback_modes) != expected_zones:
         raise ValueError("screen mode and playback zone count disagree")
+    if any(not zone and mode != PLAY_SINGLE for zone, mode in zip(value.media, value.playback_modes)):
+        raise ValueError("empty media zone requires Single playback")
     if len(value.title_colors) != expected_zones or len(value.content_colors) != expected_zones:
         raise ValueError("screen mode and color zone count disagree")
 
@@ -402,6 +404,20 @@ class ScreenState:
         return cls(**dict(value))
 
 
+def _normalize_saved_playlists(document):
+    """Earlier state files could persist an empty Random or Cycle playlist."""
+    if not isinstance(document, dict):
+        raise TypeError("stored configuration must be an object")
+    media = document.get("media", [[]])
+    modes = document.get("playback_modes")
+    if isinstance(media, list) and isinstance(modes, list) and len(media) == len(modes):
+        document["playback_modes"] = [
+            PLAY_SINGLE if zone == [] and mode in PLAY_MODES else mode
+            for zone, mode in zip(media, modes)
+        ]
+    return document
+
+
 class StateStore:
     def __init__(self, path: Union[str, Path]):
         self.path = Path(path)
@@ -459,7 +475,7 @@ class StateStore:
             if "assignments" in migrated and "slots" not in migrated:
                 migrated["slots"] = migrated.pop("assignments")
             migrated["schema_version"] = 1
-        return migrated
+        return _normalize_saved_playlists(migrated)
 
 
 @dataclass(frozen=True)
@@ -662,7 +678,7 @@ class ProfileStore:
     def _read(path: Path) -> Profile:
         with path.open("r", encoding="utf-8") as handle:
             document = json.load(handle)
-        profile = Profile.from_dict(document)
+        profile = Profile.from_dict(_normalize_saved_playlists(document))
         if profile.slug != path.stem:
             raise ValueError("profile slug does not match filename")
         return profile

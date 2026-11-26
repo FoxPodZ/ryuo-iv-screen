@@ -181,7 +181,7 @@ async def test_live_publisher_uses_fast_worker_cache_without_blocking_event_loop
     try:
         await asyncio.wait_for(ticker(), 0.15)
         assert ticks == 8
-        assert context.sse.last_event_id >= 4
+        assert context.sse.last_event_id == 1  # bounded publish rate for very small saved intervals
     finally:
         await client.close()
 
@@ -243,3 +243,30 @@ async def test_prepare_failure_does_not_leak_sse_subscriber(tmp_path, monkeypatc
         assert context.sse.subscriber_count == 0
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_previous_daemon_cursor_requests_reset(tmp_path):
+    context = AppContext(StateStore(tmp_path / "state"), ProfileStore(tmp_path / "p"), _Device(), _Telemetry())
+    async with TestClient(TestServer(create_app(context))) as client:
+        response = await client.get("/api/v1/events", headers={"Last-Event-ID": "90000"})
+        assert response.status == 409
+        assert (await response.json())["error"] == "stream_reset"
+        # A new server can pass the old cursor before a browser returns.
+        response = await client.get("/api/v1/events", headers={
+            "Last-Event-ID": "1", "X-Ryuo-Stream-Generation": "earlier-daemon"})
+        assert response.status == 409
+
+
+@pytest.mark.asyncio
+async def test_shortened_publish_interval_wakes_previous_long_sleep(tmp_path):
+    from dataclasses import replace
+    store = StateStore(tmp_path / "state")
+    store.save(ScreenState(refresh_interval=60))
+    ctx = AppContext(store, ProfileStore(tmp_path / "profiles"), _Device(), _Telemetry())
+    async with TestClient(TestServer(create_app(ctx))):
+        await asyncio.sleep(.02)
+        ctx.state = replace(ctx.state, refresh_interval=.1)
+        revision_event_id = ctx.publish_snapshot()
+        await asyncio.sleep(.4)
+        assert ctx.sse.last_event_id > revision_event_id

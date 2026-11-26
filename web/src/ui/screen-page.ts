@@ -159,8 +159,8 @@ export class ScreenPage extends LitElement {
               <fieldset>
                 <legend>Цвета зон</legend>
                 ${Array.from({length: zones}, (_, zone) => html`
-                  <label>Заголовок ${zone + 1}<input type="color" name=${`title_color_${zone}`} .value=${this.draft.title_colors[zone]} @input=${(event: Event) => this.onColor(event, "title_colors", zone)}></label>
-                  <label>Значение ${zone + 1}<input type="color" name=${`content_color_${zone}`} .value=${this.draft.content_colors[zone]} @input=${(event: Event) => this.onColor(event, "content_colors", zone)}></label>
+                  <label>Заголовок ${zone + 1}<input type="color" name=${`title_color_${zone}`} .value=${"#" + this.draft.title_colors[zone].slice(-6)} @input=${(event: Event) => this.onColor(event, "title_colors", zone)}></label>
+                  <label>Значение ${zone + 1}<input type="color" name=${`content_color_${zone}`} .value=${"#" + this.draft.content_colors[zone].slice(-6)} @input=${(event: Event) => this.onColor(event, "content_colors", zone)}></label>
                 `)}
               </fieldset>
             </div>
@@ -241,7 +241,8 @@ export class ScreenPage extends LitElement {
 
   private onColor(event: Event, field: "title_colors" | "content_colors", zone: number): void {
     const colors = [...this.draft[field]];
-    colors[zone] = (event.currentTarget as HTMLInputElement).value.toUpperCase();
+    const alpha = colors[zone].length === 9 ? colors[zone].slice(1, 3) : "";
+    colors[zone] = "#" + alpha + (event.currentTarget as HTMLInputElement).value.slice(1).toUpperCase();
     this.draft = {...this.draft, [field]: colors};
     this.queue("screen", {[field]: colors});
   }

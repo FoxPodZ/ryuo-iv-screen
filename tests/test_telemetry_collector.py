@@ -311,3 +311,17 @@ def test_runtime_stable_selectors_reprobe_and_restore_startup_defaults(tmp_path)
     sample = collector.sample()
     assert sample.measurements["gpu.load"].value == 17
     assert sample.measurements["motherboard.temperature"].value == 37
+
+
+def test_daemon_collector_maps_host_memory_and_disk(monkeypatch):
+    import psutil
+    from ryuo_screen import daemon
+    from ryuo_screen.store import AppConfig
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(total=2048 << 20, used=512 << 20, percent=25))
+    monkeypatch.setattr(psutil, "disk_usage", lambda _: SimpleNamespace(total=256 << 30, used=128 << 30, percent=50))
+    for name in ("CpuProvider", "HwmonProvider", "AmdGpuProvider", "NvidiaProvider"):
+        monkeypatch.setattr(daemon, name, lambda *args, provider=name: _Provider(provider, {}))
+    collector = daemon.build_collector(AppConfig())
+    result = collector.to_pc_info(collector.sample())
+    assert (result["memory"]["total"], result["memory"]["used"], result["memory"]["load"]) == (2048, 512, 25)
+    assert (result["disk"]["total"], result["disk"]["used"], result["disk"]["load"]) == (256, 128, 50)

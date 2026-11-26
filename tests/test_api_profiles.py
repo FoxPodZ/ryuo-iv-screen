@@ -171,3 +171,24 @@ async def test_builtin_profiles_are_virtual_and_support_api_workflows(tmp_path):
         assert sorted(p.name for p in context.profile_store.directory.iterdir()) == ["own-copy.json"]
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_profile_apply_reports_both_zones_and_matches_case(tmp_path):
+    from ryuo_screen.device import DeviceStatus
+    client, context = await _client(tmp_path)
+    async with client:
+        context.device.status = lambda: DeviceStatus(connected=True, descriptor={
+            "media": {"preset": ["P.PNG"], "custom": ["c.png"]}})
+        p = dict(_profile(), screen_mode="Screen Splitting", playback_modes=["Single", "Single"],
+                 media=[["p.png", "absent1"], ["C.PNG", "absent2"]],
+                 title_colors=["#FFFFFF"] * 2, content_colors=["#FFFFFF"] * 2)
+        assert (await client.post("/api/v1/profiles", json=p)).status == 201
+        url = "/api/v1/profiles/gaming"
+        rejected = await client.post(url + "/apply", json={"revision": 2})
+        assert rejected.status == 400
+        message = (await rejected.json())["message"]
+        assert "1" in message and "absent1" in message and "2" in message and "absent2" in message
+        assert not context.device.commands
+        assert (await client.patch(url, json={"media": [["p.png"], ["C.PNG"]]})).status == 200
+        assert (await client.post(url + "/apply", json={"revision": 2})).status == 200

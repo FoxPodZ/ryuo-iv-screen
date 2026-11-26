@@ -119,3 +119,13 @@ it("shows invalid import before sending and imports a valid JSON document", asyn
   await vi.waitFor(() => expect(requests.find(({path}) => path.endsWith("/import"))?.init.body)
     .toBe('{"slug":"imported","name":"Imported"}'));
 });
+
+it("shows both missing playlist names and their zones after a rejected apply", async () => {
+  const message = "Profile media: zone 1: missing-a.png (missing); zone 2: missing-b.png (missing)";
+  const {store} = await setup(path => path.endsWith("/apply")
+    ? json({error: "validation_error", message}, 400) : undefined);
+  const root = await render(new ProfilesPage(), store);
+  await vi.waitFor(() => expect(root.textContent).toContain("My Profile"));
+  click(get(root, '[data-profile="custom"]'), "[data-apply]");
+  await vi.waitFor(() => expect(get(root, '[role="alert"]').textContent).toContain(message));
+});

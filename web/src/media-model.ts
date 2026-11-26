@@ -4,7 +4,7 @@ export interface MediaCatalog {
   factory: string[];
   custom: string[];
   tools: {ffmpeg: boolean; ffprobe: boolean};
-  adb: {available: boolean; reason: string | null; targetToken?: string};
+  adb: {available: boolean; reason: string | null; serial?: string | null; targetToken?: string};
 }
 
 export interface MediaResult {

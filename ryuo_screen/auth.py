@@ -169,6 +169,7 @@ class SessionStore:
         self.lifetime = float(lifetime)
         self._clock = clock
         self._sessions: "OrderedDict[str, Session]" = OrderedDict()
+        self._revocation_listeners = {}
         self._lock = threading.Lock()
 
     def _prune_locked(self, now: float) -> None:
@@ -177,7 +178,29 @@ class SessionStore:
             if session.expires_at <= now
         ]
         for token in expired:
-            self._sessions.pop(token, None)
+            self._discard_locked(token)
+
+    def _discard_locked(self, token: str) -> None:
+        self._sessions.pop(token, None)
+        for notify in self._revocation_listeners.pop(token, ()):
+            notify()
+
+    def watch_revocation(self, token: str, notify: Callable[[], None]) -> Callable[[], None]:
+        """Register an event-loop wakeup for an authenticated long-lived request."""
+        with self._lock:
+            if token in self._sessions:
+                self._revocation_listeners.setdefault(token, set()).add(notify)
+            else:
+                notify()
+
+        def unsubscribe():
+            with self._lock:
+                listeners = self._revocation_listeners.get(token)
+                if listeners:
+                    listeners.discard(notify)
+                    if not listeners:
+                        del self._revocation_listeners[token]
+        return unsubscribe
 
     def create(self) -> Session:
         now = float(self._clock())
@@ -190,7 +213,7 @@ class SessionStore:
         with self._lock:
             self._prune_locked(now)
             while len(self._sessions) >= self.max_sessions:
-                self._sessions.popitem(last=False)
+                self._discard_locked(next(iter(self._sessions)))
             self._sessions[session.token] = session
         return session
 
@@ -210,7 +233,7 @@ class SessionStore:
         if not isinstance(token, str) or not token:
             return
         with self._lock:
-            self._sessions.pop(token, None)
+            self._discard_locked(token)
 
     def remaining(self, session: Session) -> float:
         """Return the truthful remaining lifetime for a still-active session."""
@@ -539,7 +562,7 @@ def _forwarded_context(
                 client = policy.forwarded_client(forwarded_for, request.remote)
             except ValueError as exc:
                 raise PermissionError("invalid forwarded client") from exc
-    return host, scheme, trusted, client
+    return host, scheme, trusted and has_forwarded, client
 
 
 @web.middleware
@@ -548,6 +571,8 @@ async def security_middleware(request: web.Request, handler):
     try:
         _reject_duplicate_security_headers(request)
         host, scheme, trusted, client = _forwarded_context(request, policy)
+        if not trusted and client and _is_loopback(client) and not _is_loopback(_host_without_port(host)):
+            raise PermissionError("direct loopback requests require a local Host")
         if not policy.allows_host(host, from_trusted_proxy=trusted):
             raise PermissionError("Host is not allowed")
         origin = request.headers.get("Origin")

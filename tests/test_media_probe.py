@@ -58,6 +58,8 @@ def test_probe_and_conversion_plans_cover_video_and_stills(tmp_path):
         "ok.mp4", "h264.mp4", "wide.mp4", "x.png", "x.jpg", "x.gif",
         "x.mkv", "x.webp",
     )]
+    for path in files:
+        path.write_bytes(b"\0\0\0\x18ftypisom")
     infos = [tools.probe(path) for path in files]
     plans = [tools.plan(info) for info in infos[:6]]
     assert plans[0].action == "passthrough"
@@ -84,6 +86,7 @@ def test_thumbnail_proxy_are_bounded_and_missing_tools_are_explicit(tmp_path):
         return Result()
 
     tools = MediaTools(runner=run, which=lambda name: "/bin/" + name)
+    (tmp_path / "in.mp4").write_bytes(b"\0\0\0\x18ftypisom")
     tools.thumbnail(tmp_path / "in.mp4", tmp_path / "thumb.jpg", width=320, height=180)
     tools.proxy(tmp_path / "in.mp4", tmp_path / "proxy.mp4", width=960, height=540)
     assert "scale=320:180" in calls[0][0]
@@ -120,3 +123,44 @@ def test_real_ffmpeg_probe_convert_probe_round_trip(tmp_path):
     assert (after.codec, after.pixel_format, after.width, after.height) == (
         "hevc", "yuv420p", 2240, 1080,
     )
+
+
+@pytest.mark.parametrize("method", ["probe", "thumbnail", "proxy", "convert"])
+def test_every_media_reader_uses_only_recognized_local_input(tmp_path, method):
+    from ryuo_screen.media import ConversionPlan
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return Result(_probe())
+    tools = MediaTools(runner=run, which=lambda x: x)
+    source = tmp_path / "upload"
+    def invoke():
+        if method == "probe":
+            return tools.probe(source)
+        if method == "convert":
+            return tools.convert(source, tmp_path / "out.mp4", ConversionPlan("transcode-video", ".mp4"))
+        return getattr(tools, method)(source, tmp_path / "out")
+    source.write_bytes(b"unrecognized document")
+    with pytest.raises(ValueError, match="unsupported"):
+        invoke()
+    assert calls == []
+    source.write_bytes(b"\0\0\0\x18ftypisom")
+    invoke()
+    args, = calls
+    assert args[args.index("-protocol_whitelist") + 1] == "file"
+    assert args[args.index("-f") + 1] == "mov"
+    assert args[args.index("-enable_drefs") + 1] == "0"
+    assert args[args.index("-use_absolute_path") + 1] == "0"
+    if method == "probe":
+        assert "-show_entries" in args and "-show_streams" not in args
+        assert args[args.index("-select_streams") + 1] == "v:0"
+
+
+def test_probe_caps_subprocess_output(tmp_path):
+    tool = tmp_path / "metadata-tool"
+    tool.write_text("#!/usr/bin/env python3\nprint('x' * 100000)\n")
+    tool.chmod(0o700)
+    source = tmp_path / "upload"
+    source.write_bytes(b"GIF89a")
+    with pytest.raises(ValueError, match="metadata exceeds"):
+        MediaTools(which=lambda _: str(tool)).probe(source)

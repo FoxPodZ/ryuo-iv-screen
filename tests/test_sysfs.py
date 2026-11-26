@@ -225,22 +225,32 @@ def test_different_chip_names_on_one_pci_device_have_distinct_sensor_refs(tmp_pa
     assert first_channel.ref.stable_id != second_channel.ref.stable_id
 
 
-def test_recycled_hwmon_class_path_does_not_read_another_device(tmp_path):
+def test_recycled_hwmon_class_path_does_not_read_another_device(tmp_path, monkeypatch):
+    from ryuo_screen.telemetry.amd import AmdGpuProvider
+
     fake = SysfsBuilder(tmp_path / "sys")
     first = fake.pci()
     second = fake.pci("0000:05:00.0")
     old_chip_path = fake.hwmon(first, 2, "amdgpu", {"temp1": (45000, "edge")})
+    (old_chip_path / "power1_average").write_text("75000000")
     sysfs = Sysfs(fake.root)
     old_chip, = enumerate_hwmon(sysfs)
     old_channel, = old_chip.channels
     assert sysfs.read_number(old_channel.input_path, 0.001).value == 45.0
 
+    provider = AmdGpuProvider(sysfs, first.name)
+    # Keep the discovery snapshot while the kernel recycles its class alias.
+    monkeypatch.setattr(provider, "_hwmon_by_device", lambda: {old_chip.device_id: [old_chip]})
+    assert provider.sample().measurements["gpu.power"].value == 75
     (fake.root / "class/hwmon/hwmon2").unlink()
     old_chip_path.rename(first / "removed-hwmon2")
-    fake.hwmon(second, 2, "amdgpu", {"temp1": (93000, "edge")})
+    replacement = fake.hwmon(second, 2, "amdgpu", {"temp1": (93000, "edge")})
+    (replacement / "power1_average").write_text("165000000")
     new_chip, = enumerate_hwmon(sysfs)
     new_channel, = new_chip.channels
 
+    assert sysfs.read_number(new_chip.canonical_path / "power1_average", .000001).value == 165
+    assert not provider.sample().measurements["gpu.power"].available
     assert old_channel.ref != new_channel.ref
     assert sysfs.read_number(new_channel.input_path, 0.001).value == 93.0
     stale = sysfs.read_number(old_channel.input_path, 0.001)

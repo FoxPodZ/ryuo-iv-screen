@@ -19,7 +19,7 @@ Leave the demo running. In another terminal at the repository root, run the capt
 node web/demo/capture.mjs
 ```
 
-The command launches headless Firefox with a temporary profile. It waits for the example values, checks the demo label and horizontal fit, and writes four 1440 × 1100 PNGs at device pixel ratio 1. The image set reflects the browser viewport. Longer pages continue below its bottom edge. [Documentation gallery](../../docs/web-ui.md#demo-screenshots)
+The command launches headless Firefox with a temporary profile. It waits for the example values, checks the demo label and horizontal fit, and writes four 1440-pixel-wide PNGs at device pixel ratio 1. Each desktop viewport expands to include the page controls. [Documentation gallery](../../docs/web-ui.md#demo-screenshots)
 
 For an additional 390 × 844 mobile Dashboard capture, supply a destination outside the documentation gallery.
 

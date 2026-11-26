@@ -117,3 +117,13 @@ it("recovers the connected store after interrupting a real demo event stream", a
     vi.unstubAllGlobals();
   }
 });
+
+it.each(["", "01", "0x10", "1e2", "1.00000000000000001", String(Number.MAX_SAFE_INTEGER)])(
+  "rejects an unrepresentable demo cursor %j", async cursor => {
+    const abort = new AbortController();
+    try {
+      const res = await fetch(base + "/events", {headers: {"Last-Event-ID": cursor}, signal: abort.signal});
+      expect(res.status).toBe(400);
+    } finally { abort.abort(); }
+  }
+);

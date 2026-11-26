@@ -12,8 +12,9 @@ export class DevicePreview extends LitElement {
     figure { margin: 0; display: grid; gap: .65rem; }
     figcaption { color: #aeb9c9; font-size: .78rem; }
     .panel { aspect-ratio: 2240 / 1080; display: grid; grid-template-columns: 1fr; overflow: hidden; border: .55rem solid #202838; border-radius: 1.2rem; background: #070a11; box-shadow: inset 0 0 3rem #000, 0 1rem 2.5rem #0005; opacity: calc(var(--preview-opacity, 100) / 100); }
-    .panel.split { grid-template-columns: 1fr 1fr; }
-    .zone { display: grid; grid-template-columns: repeat(3, 1fr); gap: .35rem; padding: .7rem; border-right: 1px solid #ffffff18; background: radial-gradient(circle at 25% 0%, #153f4c, transparent 60%); }
+    .panel.split { grid-template-columns: minmax(0, 1606fr) minmax(0, 634fr); }
+    .panel.split .zone:last-child { grid-template-columns: 1fr; grid-template-rows: repeat(3, minmax(0, 1fr)); }
+    .zone { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; padding: .7rem; border-right: 1px solid #ffffff18; background: radial-gradient(circle at 25% 0%, #153f4c, transparent 60%); }
     .slot { display: grid; place-content: center; min-width: 0; padding: .3rem; border-radius: .45rem; background: #111827c9; color: #fff; text-align: center; font-size: clamp(.5rem, 1.2vw, .78rem); overflow-wrap: anywhere; }
     .slot.off { opacity: .25; }
   `;

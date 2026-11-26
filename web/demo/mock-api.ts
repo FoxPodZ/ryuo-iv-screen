@@ -76,9 +76,9 @@ export function demoApi(): Plugin {
         const path = (request.url || "/").split("?")[0];
         response.setHeader("Cache-Control", "no-store");
         if (request.method === "GET" && path === "/events") {
-          const previous = Number(request.headers["last-event-id"] ?? 0);
-          const next = previous + 1;
-          if (!Number.isSafeInteger(next) || next < 1) {
+          const raw = request.headers["last-event-id"] ?? "0";
+          const next = Number(raw) + 1;
+          if (typeof raw !== "string" || !/^(0|[1-9][0-9]*)$/.test(raw) || !Number.isSafeInteger(next)) {
             response.writeHead(400, {"Content-Type": "application/json"});
             response.end(JSON.stringify({demo: true, error: "invalid_last_event_id"}));
             return;

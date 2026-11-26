@@ -79,6 +79,21 @@ try {
       const fits = await evaluate(`[...${page}.querySelectorAll(".controls input")].every(input =>
         input.getBoundingClientRect().right <= input.closest("label").getBoundingClientRect().right + 1)`);
       assert.ok(fits, "Screen controls extend beyond their own columns");
+      const ratio = await evaluate(`(() => {
+        const zones = ${page}.querySelector("device-preview").shadowRoot.querySelectorAll(".panel.split .zone");
+        return zones[0].getBoundingClientRect().width / zones[1].getBoundingClientRect().width;
+      })()`);
+      assert.ok(Math.abs(ratio - 1606 / 634) < .02, "Split preview ratio: " + ratio);
+      const readable = await evaluate(`[...${page}.querySelector("device-preview").shadowRoot
+        .querySelectorAll(".zone:last-child .slot")].every(slot => slot.clientWidth >= 55)`);
+      assert.ok(readable, "Narrow zone compresses labels into individual letters");
+    }
+    if (await evaluate("innerWidth === 1440")) {
+      const contentBottom = await evaluate(`Math.ceil(${app}.querySelector("main").getBoundingClientRect().bottom + scrollY)`);
+      await viewport(1440, Math.max(1100, contentBottom + 24));
+      await evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))");
+      assert.ok(await evaluate(`[...${page}.querySelectorAll("sensor-slot, button")].every(control =>
+        control.getBoundingClientRect().bottom <= innerHeight + 1)`), "Lower controls clipped: " + tab);
     }
     assert.ok(await evaluate(`performance.getEntriesByType("resource").every(r => new URL(r.name).origin === location.origin)`),
       "Demo page requested a resource outside its local server");

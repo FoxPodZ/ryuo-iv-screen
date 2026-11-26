@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -12,6 +13,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 import ryuo_hid
 import ryuo_proto as proto
 
+from .catalog import MediaCatalog
 from .models import CommandResult, SensorDescriptor, TelemetrySnapshot
 from .ownership import DeviceOwnership
 from .store import ScreenState
@@ -82,9 +84,13 @@ class HidTransport:
         else:
             selected = next(
                 (item for item in devices
-                 if item.get("interface_number") == self._interface),
-                devices[0],
+                 if item.get("interface_number") == self._interface
+                 and item.get("product_id") == self._pid
+                 and item.get("vendor_id") in ((self._vid,) if self._vid else proto.VIDS)),
+                None,
             )
+            if selected is None:
+                raise OSError("Ryuo IV HID screen interface is not present")
         handle = self._hid.device()
         handle.open_path(selected["path"])
         handle.set_nonblocking(1)
@@ -122,6 +128,8 @@ class DeviceCommand:
     expect_reply: bool = False
     state: Optional[ScreenState] = None
     saved: bool = False
+    catalog_generation: Optional[int] = None
+    deadline: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.method, str) or not self.method:
@@ -211,6 +219,7 @@ class CommandTicket:
         self._event = threading.Event()
         self._result: Optional[CommandResult] = None
         self._saved = saved
+        self.cancelled = threading.Event()
 
     @property
     def done(self) -> bool:
@@ -250,6 +259,7 @@ class DeviceStatus:
     last_ack: Optional[int] = None
     heartbeat_age: Optional[float] = None
     last_error: Optional[str] = None
+    catalog_generation: int = 0
     descriptor: Mapping[str, Any] = field(default_factory=dict)
     model: Optional[str] = None
     firmware: Optional[str] = None
@@ -333,6 +343,8 @@ class DeviceWorker:
         self._last_heartbeat: Optional[float] = None
         self._last_send: Optional[float] = None
         self._last_error: Optional[str] = None
+        self._catalog_generation = 0
+        self._config_error = None
         self._descriptor: Dict[str, Any] = {}
         self._model: Optional[str] = None
         self._firmware: Optional[str] = None
@@ -343,6 +355,9 @@ class DeviceWorker:
         self._started_at: Optional[float] = None
         self._last_safe = proto.pc_info(timestamp_ms=0)
         self._latest_telemetry = LatestTelemetry()
+        self._last_sample_time = None
+        self._sample_error = None
+        self._thermal_error = None
         self._next_keepalive: Optional[float] = None
         self._last_loop_clock: Optional[float] = None
         self._session_active = False
@@ -409,6 +424,13 @@ class DeviceWorker:
                     saved=command.saved, queued=False, error="worker is not running"
                 ))
                 return ticket
+            if command.resource == proto.RES_MEDIA_DELETE and (
+                not self._connected or self._resume_requested
+                or command.catalog_generation != self._catalog_generation
+                or command.deadline is None or time.monotonic() >= command.deadline
+            ):
+                ticket._complete(CommandResult(queued=False, error="delete target changed or command expired"))
+                return ticket
             if command.coalesce_key:
                 for index, queued in enumerate(self._pending):
                     if queued.command.coalesce_key == command.coalesce_key:
@@ -437,7 +459,7 @@ class DeviceWorker:
         with self._condition:
             now = self._clock()
             return DeviceStatus(
-                phase=self._phase,
+                phase="degraded" if self._connected and (self._config_error or self._thermal_error) else self._phase,
                 connected=self._connected,
                 sequence=self._sequence - 1,
                 queue_depth=len(self._pending),
@@ -446,7 +468,8 @@ class DeviceWorker:
                 last_ack=self._last_ack,
                 heartbeat_age=(None if self._last_heartbeat is None
                                else max(0.0, now - self._last_heartbeat)),
-                last_error=self._last_error,
+                last_error=self._config_error or self._thermal_error or self._last_error,
+                catalog_generation=self._catalog_generation,
                 descriptor=copy.deepcopy(self._descriptor),
                 model=self._model,
                 firmware=self._firmware,
@@ -505,13 +528,17 @@ class DeviceWorker:
                                  or queued.command.priority >= PRIORITY_KEEPALIVE)):
                         self._send_keepalive()
                         continue
+                    sample_delay = self._sample_delay(now)
+                    if sample_delay <= 0:
+                        self._sample_telemetry()
+                        continue
                     queued = self._pop()
                     if queued is not None:
                         self._process(queued)
                         continue
                     delay = (self._keepalive_interval if self._next_keepalive is None
                              else max(0.0, self._next_keepalive - now))
-                    self._wait(min(delay, 0.25))
+                    self._wait(min(delay, sample_delay, 0.25))
                 except OSError as exc:
                     if self._should_stop():
                         break
@@ -534,6 +561,8 @@ class DeviceWorker:
                 self._connected = False
                 self._session_active = False
                 self._phase = "stopped"
+                self._descriptor = {}
+                self._firmware = self._model = None
                 for queued in self._pending:
                     queued.ticket._complete(CommandResult(
                         saved=queued.command.saved, queued=True,
@@ -546,31 +575,34 @@ class DeviceWorker:
         with self._condition:
             self._phase = "connecting"
             self._last_dynamic_preset = None
+            self._last_sample_time = None
         self._transport.open()
         try:
-            body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5,
-                              bypass_rate=True)
+            descriptor = self._read_conn()
             with self._condition:
                 self._session_active = True
-            descriptor = proto.reply_json(body)
-            if not isinstance(descriptor, dict):
-                descriptor = {}
-            descriptor = proto.redact_conn(descriptor)
-            with self._condition:
                 self._descriptor = descriptor
+                self._catalog_generation += 1
                 self._model = self._descriptor_value(
                     descriptor, ("model", "product", "productName", "name")
                 )
                 self._firmware = self._descriptor_value(
                     descriptor, ("firmware", "firmwareVersion", "fwVersion", "version")
                 )
+                version = descriptor.get("version")
+                if isinstance(version, Mapping):
+                    self._firmware = self._descriptor_value(version, ("firmware",)) or self._firmware
                 self._phase = "configuring"
             configured_state = self._desired_state
-            payload = proto.config_payload_from_state(configured_state)
-            proto.request(proto.POST, proto.RES_CONFIG, payload, seq=self._sequence)
-            self._send(proto.POST, proto.RES_CONFIG, payload, timeout=0.5)
-            if self._settle_seconds and self._sleep(self._settle_seconds):
-                return
+            try:
+                payload = self._config_payload(configured_state)
+            except ValueError as exc:
+                self._config_error = str(exc)
+            else:
+                self._config_error = None
+                self._send(proto.POST, proto.RES_CONFIG, payload, timeout=0.5)
+                if self._settle_seconds and self._sleep(self._settle_seconds):
+                    return
             telemetry_ok = self._send_keepalive()
             with self._condition:
                 self._connected = True
@@ -582,14 +614,14 @@ class DeviceWorker:
                     self._recovery_count += 1
                 self._ever_connected = True
                 self._had_failure = False
-                self._applied_state = configured_state
+                self._applied_state = None if self._config_error else configured_state
                 self._last_loop_clock = self._clock()
                 remaining = []
                 for queued in self._pending:
                     if queued.command.state == configured_state:
                         queued.ticket._complete(CommandResult(
-                            saved=True, queued=True, applied=True,
-                            acked=False,
+                            saved=True, queued=True, applied=self._config_error is None,
+                            acked=False, error=self._config_error,
                         ))
                     else:
                         remaining.append(queued)
@@ -599,6 +631,21 @@ class DeviceWorker:
             if not self._should_stop():
                 self._transport.close()
             raise
+
+    def _config_payload(self, state: ScreenState) -> Mapping[str, Any]:
+        media = MediaCatalog.from_conn(self._descriptor).resolve_playlists(state.media)
+        return proto.config_payload_from_state(replace(state, media=media))
+
+    def _read_conn(self) -> Mapping[str, Any]:
+        body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5, bypass_rate=True)
+        if not body or body.partition("\r\n")[0] != "1 200":
+            raise OSError("device did not acknowledge conn")
+        descriptor = proto.reply_json(body)
+        try:
+            MediaCatalog.from_conn(descriptor)
+        except (TypeError, ValueError) as exc:
+            raise OSError("invalid conn media catalog") from exc
+        return proto.redact_conn(descriptor)
 
     @staticmethod
     def _descriptor_value(document: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -612,11 +659,18 @@ class DeviceWorker:
         command = queued.command
         if command.state is not None:
             try:
-                plan = plan_state_change(self._applied_state, command.state)
+                if self._applied_state is None:
+                    plan = ApplyPlan((command,), full_config=True, requires_settle=True)
+                else:
+                    plan = plan_state_change(self._applied_state, command.state)
+                if (not plan.full_config and self._applied_state is not None
+                        and self._applied_state.active_profile != command.state.active_profile):
+                    MediaCatalog.from_conn(self._descriptor).resolve_playlists(command.state.media)
                 acked = True
                 for planned in plan.commands:
+                    payload = self._config_payload(command.state) if plan.full_config else planned.payload
                     body = self._send(
-                        planned.method, planned.resource, planned.payload,
+                        planned.method, planned.resource, payload,
                         timeout=0.3 if planned.expect_reply else 0,
                     )
                     acked = acked and body is not None
@@ -635,17 +689,41 @@ class DeviceWorker:
                 # Keep the latest state queued: reconnect's full config applies it.
                 self._requeue_failed_state(queued)
                 raise
+            self._config_error = None
             self._applied_state = command.state
             queued.ticket._complete(CommandResult(
                 saved=True, queued=True, applied=True,
                 acked=bool(plan.commands) and acked,
             ))
             return
+        deleting = command.resource == proto.RES_MEDIA_DELETE
         try:
+            def check_delete():
+                if (self._resume_requested or queued.ticket.cancelled.is_set()
+                        or command.catalog_generation != self._catalog_generation
+                        or command.deadline is None or time.monotonic() >= command.deadline):
+                    raise ValueError("delete target changed or command expired")
+                names = (command.payload or {}).get("include", [])
+                catalog = MediaCatalog.from_conn(self._descriptor)
+                if len(names) != 1 or catalog.classify(names[0]) != "custom":
+                    raise ValueError("delete requires a current custom media name")
+
             body = self._send(
                 command.method, command.resource, command.payload,
                 timeout=0.3 if command.expect_reply else 0,
+                before_write=check_delete if deleting else None,
             )
+            if deleting:
+                # Read the directory on the same open handle before another
+                # command or recovery can replace the connection.
+                descriptor = self._read_conn()
+                with self._condition:
+                    self._descriptor = descriptor
+                    self._catalog_generation += 1
+                name = command.payload["include"][0]
+                if (not body or body.partition("\r\n")[0] != "1 200"
+                        or name in MediaCatalog.from_conn(descriptor).custom):
+                    raise ValueError("delete not confirmed by device")
         except ValueError as exc:
             queued.ticket._complete(CommandResult(
                 saved=command.saved, queued=True, applied=False, error=str(exc)
@@ -663,12 +741,16 @@ class DeviceWorker:
             acked=body is not None,
         ))
 
-    def _send_keepalive(self) -> bool:
+    def _sample_delay(self, now: float) -> float:
+        if self._last_sample_time is None:
+            return 0.0
+        return self._last_sample_time + max(0.1, self._desired_state.refresh_interval) - now
+
+    def _sample_telemetry(self) -> None:
         try:
             payload, telemetry_error = self._collect_telemetry()
             self._last_safe = payload
         except Exception as exc:
-            payload = self._last_safe
             telemetry_error = "telemetry: {}".format(exc)
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(
@@ -676,6 +758,14 @@ class DeviceWorker:
                     self._latest_telemetry.catalog,
                     str(exc),
                 )
+        self._sample_error = telemetry_error
+        self._last_sample_time = self._clock()
+
+    def _send_keepalive(self) -> bool:
+        if self._sample_delay(self._clock()) <= 0:
+            self._sample_telemetry()
+        payload = self._last_safe
+        telemetry_error = self._sample_error
         telemetry_ok = telemetry_error is None
         with self._condition:
             if self._connected:
@@ -693,7 +783,8 @@ class DeviceWorker:
         if dynamic is not None and dynamic != self._last_dynamic_preset:
             self._send(proto.POST, proto.RES_PRESET, dynamic, timeout=0)
             self._last_dynamic_preset = copy.deepcopy(dynamic)
-        elif dynamic is None:
+        elif dynamic is None and self._last_dynamic_preset is not None:
+            self._send(proto.POST, proto.RES_PRESET, proto.preset_payload_from_state(self._desired_state), timeout=0)
             self._last_dynamic_preset = None
         with self._condition:
             self._last_heartbeat = now
@@ -706,19 +797,21 @@ class DeviceWorker:
         with self._condition:
             state = self._desired_state
             snapshot = self._latest_telemetry.snapshot
+        self._thermal_error = None
         if state.rgb_mode == "off":
             return None
         if state.rgb_mode == "hue":
             colour = proto.hsv_hex((float(now) % 10.0) / 10.0)
         else:
-            if snapshot is None:
-                return None
-            reading = snapshot.measurements.get(state.thermal_source)
+            reading = snapshot.measurements.get(state.thermal_source) if snapshot is not None else None
             if (
-                reading is None or not reading.available
+                self._sample_error or reading is None or not reading.available
+                or reading.unit not in ("C", "°C")
+                or not 0 <= time.time() - reading.sampled_at <= max(2.0, 2 * state.refresh_interval)
                 or not isinstance(reading.value, (int, float))
-                or isinstance(reading.value, bool)
+                or isinstance(reading.value, bool) or not math.isfinite(reading.value)
             ):
+                self._thermal_error = "thermal source {} requires a fresh Celsius reading".format(state.thermal_source)
                 return None
             colour = proto.thermal_hex(
                 float(reading.value), phase=bool(int(float(now)) % 2)
@@ -798,6 +891,7 @@ class DeviceWorker:
     def _send(
         self, method: str, resource: str, payload: Optional[Mapping[str, Any]],
         *, timeout: float, bypass_rate: bool = False,
+        before_write: Optional[Callable[[], None]] = None,
     ) -> Optional[str]:
         seq = self._sequence
         if seq > MAX_SEQUENCE:
@@ -807,6 +901,8 @@ class DeviceWorker:
             delay = self._min_send_gap - (self._clock() - self._last_send)
             if delay > 0 and self._sleep(delay):
                 raise OSError("worker stopped before write")
+        if before_write is not None:
+            before_write()
         self._sequence += 1
         body = self._transport.transact(
             method, resource, payload, seq=seq, timeout=timeout
@@ -827,8 +923,16 @@ class DeviceWorker:
             self._connected = False
             self._session_active = False
             self._phase = "disconnected"
+            self._descriptor = {}
+            self._config_error = None
+            self._thermal_error = None
+            self._model = self._firmware = None
             self._last_error = str(exc)
             self._had_failure = True
+            for queued in tuple(self._pending):
+                if queued.command.resource == proto.RES_MEDIA_DELETE:
+                    self._pending.remove(queued)
+                    queued.ticket._complete(CommandResult(queued=True, error="delete target disconnected"))
             self._next_keepalive = None
             self._last_loop_clock = None
             self._condition.notify_all()
