@@ -71,8 +71,8 @@ it("opens each new page from the app shell with one main landmark", async () => 
   }
 });
 
-it("identifies the selected transfer device", async () => {
-  const {store} = await setup();
+it.each([true, false])("identifies the selected transfer device with ADB availability %s", async available => {
+  const {store} = await setup(undefined, available);
   const root = await render(new MediaPage(), store);
   await vi.waitFor(() => expect(root.textContent).toContain("adb-sensitive-serial"));
 });

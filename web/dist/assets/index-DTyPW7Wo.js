@@ -347,7 +347,7 @@
         ${this.view?.mediaError?w`<p class="error" role="alert">${this.view.mediaError}</p>`:E}
         ${this.error?w`<p class="error" role="alert">${this.error}</p>`:E}
         ${this.feedback?w`<p class="active" role="status">${this.feedback}</p>`:E}
-        ${e?.adb.available&&e.adb.serial?w`<p>Устройство ADB · <code>${e.adb.serial}</code></p>`:E}
+        ${e?.adb.serial?w`<p>Устройство ADB · <code>${e.adb.serial}</code></p>`:E}
         ${e&&!e.adb.available?w`<p class="notice" role="status">ADB недоступен · загрузка и предпросмотр отключены. ${e.adb.reason}</p>`:E}
         ${e&&!e.tools.ffmpeg?w`<p class="notice" role="status">FFmpeg недоступен · предпросмотр и конвертация отключены.</p>`:E}
         ${e&&!e.tools.ffprobe?w`<p class="notice" role="status">FFprobe недоступен · загрузка отключена.</p>`:E}

@@ -277,7 +277,9 @@ def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
 
     class StructuredTelemetry:
         def sample(self):
-            return snapshot
+            now = time.time()
+            temperature = Measurement(SensorRef("cpu", "cpu", "temp1"), "cpu.temperature", 70, "°C", now)
+            return TelemetrySnapshot({**snapshot.measurements, "cpu.temperature": temperature}, now)
 
         def catalog(self):
             return tuple(descriptors)
@@ -290,7 +292,7 @@ def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
                     "name": aliases.get((key, reading.ref), "F{}".format(index)),
                     "value": int(reading.value),
                 }
-                for index, (key, reading) in enumerate(value.measurements.items())
+                for index, (key, reading) in enumerate(value.measurements.items()) if reading.unit == "RPM"
             ], timestamp_ms=1)
 
     # Find a runtime magnitude where original names still fit but aliases do
@@ -319,7 +321,7 @@ def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
 
     transport = FakeTransport()
     worker = DeviceWorker(
-        transport, telemetry, state=ScreenState(slots=tuple(slots)),
+        transport, telemetry, state=ScreenState(slots=tuple(slots), rgb_mode="thermal"),
         keepalive_interval=0.02, settle_seconds=0, max_rate=200,
     )
     worker.start()
@@ -329,6 +331,10 @@ def test_alias_growth_falls_back_to_bounded_original_keepalive_names():
         ]) >= 3)
         status = worker.status()
         assert status.phase == "degraded"
+        preset_colors = [
+            call[4]["settings"]["contentColor"] for call in transport.calls if call[3] == proto.RES_PRESET
+        ]
+        assert proto.thermal_hex(70) in preset_colors
         assert status.last_error == "fan alias frame overflow"
         base_payloads = [
             call[4] for call in transport.calls if call[3] == proto.RES_ALL
@@ -815,3 +821,30 @@ def test_disconnected_delete_finishes_while_reopen_is_still_blocked():
         release.set()
         t.release.set()
         w.stop()
+
+
+def test_delete_confirmation_observes_hid_write_interval():
+    writes = []
+
+    class TimedTransport(CatalogTransport):
+        def transact(self, method, resource, payload, **args):
+            writes.append((resource, time.monotonic()))
+            if resource == proto.RES_MEDIA_DELETE:
+                self.reply = _reply({"media": {"preset": [], "custom": []}})
+            return super().transact(method, resource, payload, **args)
+
+    worker = DeviceWorker(TimedTransport(), lambda: proto.pc_info(), settle_seconds=0, max_rate=8)
+    worker.start()
+    try:
+        _wait(lambda: worker.status().connected)
+        ticket = worker.submit(DeviceCommand(
+            proto.POST, proto.RES_MEDIA_DELETE, {"include": ["mine.png"]}, expect_reply=True,
+            catalog_generation=worker.status().catalog_generation, deadline=time.monotonic() + 2,
+        ))
+        assert ticket.wait(2).applied
+        index = next(i for i, (resource, _) in enumerate(writes) if resource == proto.RES_MEDIA_DELETE)
+        resource, confirmation_time = writes[index + 1]
+        assert resource == proto.RES_CONN
+        assert confirmation_time - writes[index][1] >= 1 / 8
+    finally:
+        worker.stop()

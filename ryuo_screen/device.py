@@ -357,6 +357,7 @@ class DeviceWorker:
         self._latest_telemetry = LatestTelemetry()
         self._last_sample_time = None
         self._sample_error = None
+        self._frame_warning = None
         self._thermal_error = None
         self._next_keepalive: Optional[float] = None
         self._last_loop_clock: Optional[float] = None
@@ -578,7 +579,7 @@ class DeviceWorker:
             self._last_sample_time = None
         self._transport.open()
         try:
-            descriptor = self._read_conn()
+            descriptor = self._read_conn(bypass_rate=True)
             with self._condition:
                 self._session_active = True
                 self._descriptor = descriptor
@@ -636,8 +637,8 @@ class DeviceWorker:
         media = MediaCatalog.from_conn(self._descriptor).resolve_playlists(state.media)
         return proto.config_payload_from_state(replace(state, media=media))
 
-    def _read_conn(self) -> Mapping[str, Any]:
-        body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5, bypass_rate=True)
+    def _read_conn(self, *, bypass_rate: bool = False) -> Mapping[str, Any]:
+        body = self._send(proto.POST, proto.RES_CONN, None, timeout=0.5, bypass_rate=bypass_rate)
         if not body or body.partition("\r\n")[0] != "1 200":
             raise OSError("device did not acknowledge conn")
         descriptor = proto.reply_json(body)
@@ -748,24 +749,24 @@ class DeviceWorker:
 
     def _sample_telemetry(self) -> None:
         try:
-            payload, telemetry_error = self._collect_telemetry()
-            self._last_safe = payload
+            self._last_safe, self._frame_warning = self._collect_telemetry()
+            self._sample_error = None
         except Exception as exc:
-            telemetry_error = "telemetry: {}".format(exc)
+            self._sample_error = "telemetry: {}".format(exc)
+            self._frame_warning = None
             with self._condition:
                 self._latest_telemetry = LatestTelemetry(
                     self._latest_telemetry.snapshot,
                     self._latest_telemetry.catalog,
                     str(exc),
                 )
-        self._sample_error = telemetry_error
         self._last_sample_time = self._clock()
 
     def _send_keepalive(self) -> bool:
         if self._sample_delay(self._clock()) <= 0:
             self._sample_telemetry()
         payload = self._last_safe
-        telemetry_error = self._sample_error
+        telemetry_error = self._sample_error or self._frame_warning
         telemetry_ok = telemetry_error is None
         with self._condition:
             if self._connected:

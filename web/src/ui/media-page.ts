@@ -123,7 +123,7 @@ export class MediaPage extends LitElement {
         ${this.view?.mediaError ? html`<p class="error" role="alert">${this.view.mediaError}</p>` : nothing}
         ${this.error ? html`<p class="error" role="alert">${this.error}</p>` : nothing}
         ${this.feedback ? html`<p class="active" role="status">${this.feedback}</p>` : nothing}
-        ${library?.adb.available && library.adb.serial ? html`<p>Устройство ADB · <code>${library.adb.serial}</code></p>` : nothing}
+        ${library?.adb.serial ? html`<p>Устройство ADB · <code>${library.adb.serial}</code></p>` : nothing}
         ${library && !library.adb.available ? html`<p class="notice" role="status">ADB недоступен · загрузка и предпросмотр отключены. ${library.adb.reason}</p>` : nothing}
         ${library && !library.tools.ffmpeg ? html`<p class="notice" role="status">FFmpeg недоступен · предпросмотр и конвертация отключены.</p>` : nothing}
         ${library && !library.tools.ffprobe ? html`<p class="notice" role="status">FFprobe недоступен · загрузка отключена.</p>` : nothing}
